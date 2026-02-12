@@ -1,0 +1,38 @@
+name: 'Auto update flake'
+
+on:
+  workflow_dispatch: # Allows manual triggering
+  schedule:
+    - cron: '37 17 * * *' # Runs daily at 17:37 UTC
+
+permissions:
+  contents: write
+
+jobs:
+  auto-update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v30
+        with:
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update flake.lock
+        run: nix flake update
+
+      # Optional: Verify the build still works before committing
+      - name: Check flake health
+        run: nix flake check
+
+      - name: Commit and Push changes
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: 'build: auto-update flake.lock'
+          file_pattern: 'flake.lock'
+          commit_user_name: 'github-actions[bot]'
+          commit_user_email: 'github-actions[bot]@users.noreply.github.com'
