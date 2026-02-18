@@ -15,11 +15,11 @@
         # We use 'prev.qemu' to grab the original, then 'overrideAttrs' to change it
         qemu = prev.qemu.overrideAttrs (oldAttrs: {
           pname = "qemu-patched";
-          version = "10.2.0";
+          version = "10.2.1";
 
           src = prev.fetchurl {
-            url = "https://download.qemu.org/qemu-10.2.0.tar.xz";
-            hash = "sha256-njCtG4ufe0RjABWC0aspfznPzOpdCFQMDKbWZyeFiDo=";
+            url = "https://download.qemu.org/qemu-10.2.1.tar.xz";
+            hash = "sha256-o3F0d9jiyE1jC//7wg9s0yk+tFqh5trG0MwnaJmRyeE=";
           };
 
           # The missing semicolon was here!
