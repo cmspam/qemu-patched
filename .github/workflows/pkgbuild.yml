@@ -183,39 +183,27 @@ jobs:
           echo "=== Verification ==="
           grep "configure.*extra-cflags" PKGBUILD
 
-      # idef-parser is a host build tool compiled with our march flags (baked
-      # into config-meson.cross by QEMU's configure). On znver4 it then crashes
-      # immediately when the GitHub runner tries to execute it. Excluding the
-      # hexagon target avoids building idef-parser entirely.
-      # v3 is supported by GitHub runners so hexagon builds fine there.
-      - name: Exclude hexagon target for znver4
+      # For znver4, host build tools (idef-parser, gen-features, etc.) are
+      # compiled with our march flags baked into config-meson.cross by QEMU's
+      # configure, then immediately executed on the build host — crashing
+      # because GitHub runners don't support znver4.
+      #
+      # Fix: after configure writes build.ninja, we split the build into two
+      # ninja passes. First we patch build.ninja to strip march flags and build
+      # only the known host tools. Then we restore build.ninja and run the full
+      # build — ninja sees the host tool binaries already exist with fresh
+      # timestamps and skips recompiling them.
+      #
+      # We patch the PKGBUILD's build() subshell to do this transparently.
+      - name: Patch build() for znver4 host tool workaround
         if: matrix.target == 'znver4'
         run: |
-          cat > /tmp/inject_no_hexagon.py << 'PYEOF'
-          import sys
-
-          with open('PKGBUILD', 'r') as f:
-              content = f.read()
-
-          marker = '--extra-cflags="-march=znver4 -mtune=znver4" --extra-cxxflags="-march=znver4 -mtune=znver4"'
-          if marker not in content:
-              print('ERROR: march marker not found in PKGBUILD')
-              sys.exit(1)
-
-          content = content.replace(
-              marker,
-              marker + ' --target-list-exclude=hexagon-linux-user',
-              1
-          )
-
-          with open('PKGBUILD', 'w') as f:
-              f.write(content)
-
-          print('hexagon-linux-user excluded for znver4 build')
-          PYEOF
-          cd build && python3 /tmp/inject_no_hexagon.py
+          # Script is base64-encoded to avoid YAML/shell quoting issues
+          # (single quotes in sed expressions break heredocs and YAML parsing).
+          echo 'aW1wb3J0IHN5cwoKd2l0aCBvcGVuKCdQS0dCVUlMRCcsICdyJykgYXMgZjoKICAgIGNvbnRlbnQgPSBmLnJlYWQoKQoKb2xkID0gJyAgICAuLi8kcGtnYmFzZS0kcGtndmVyL2NvbmZpZ3VyZSAiJHtjb25maWd1cmVfb3B0aW9uc1tAXX0iIC0tZXh0cmEtY2ZsYWdzPSItbWFyY2g9em52ZXI0IC1tdHVuZT16bnZlcjQiIC0tZXh0cmEtY3h4ZmxhZ3M9Ii1tYXJjaD16bnZlcjQgLW10dW5lPXpudmVyNCJcbiAgICBuaW5qYScKbmV3ID0gKAogICAgJyAgICAuLi8kcGtnYmFzZS0kcGtndmVyL2NvbmZpZ3VyZSAiJHtjb25maWd1cmVfb3B0aW9uc1tAXX0iJwogICAgJyAtLWV4dHJhLWNmbGFncz0iLW1hcmNoPXpudmVyNCAtbXR1bmU9em52ZXI0IicKICAgICcgLS1leHRyYS1jeHhmbGFncz0iLW1hcmNoPXpudmVyNCAtbXR1bmU9em52ZXI0IlxuJwogICAgJyAgICBjcCBidWlsZC5uaW5qYSBidWlsZC5uaW5qYS5iYWtcbicKICAgICIgICAgc2VkIC1pICdzLyAtbWFyY2g9em52ZXI0IC1tdHVuZT16bnZlcjQvL2cnIGJ1aWxkLm5pbmphXG4iCiAgICAnICAgIG5pbmphIHRhcmdldC9oZXhhZ29uL2lkZWYtcGFyc2VyIHRhcmdldC9zMzkweC9nZW4tZmVhdHVyZXMgbGludXgtdXNlci9nZW4tdmRzbyAyPi9kZXYvbnVsbCB8fCB0cnVlXG4nCiAgICAnICAgIGdyZXAgLW9QICIoPzw9TElOSyBhcmdzICkuKj8oPz0gKSIgYnVpbGQubmluamEgMj4vZGV2L251bGwgfCBncmVwICJedGFyZ2V0LyIgfCB3aGlsZSByZWFkIHQ7IGRvIG5pbmphICIkdCIgMj4vZGV2L251bGwgfHwgdHJ1ZTsgZG9uZVxuJwogICAgJyAgICBtdiBidWlsZC5uaW5qYS5iYWsgYnVpbGQubmluamFcbicKICAgICcgICAgZmluZCB0YXJnZXQvIGxpbnV4LXVzZXIvIC1tYXhkZXB0aCAzIC10eXBlIGYgLWV4ZWN1dGFibGUgISAtbmFtZSAiKi5zbyIgISAtbmFtZSAiKi5hIiB8IHhhcmdzIHRvdWNoIDI+L2Rldi9udWxsIHx8IHRydWVcbicKICAgICcgICAgbmluamEnCikKCmlmIG9sZCBub3QgaW4gY29udGVudDoKICAgIHByaW50KCdFUlJPUjogY29uZmlndXJlK25pbmphIHBhdHRlcm4gbm90IGZvdW5kIGluIFBLR0JVSUxEJykKICAgIHN5cy5leGl0KDEpCgpjb250ZW50ID0gY29udGVudC5yZXBsYWNlKG9sZCwgbmV3LCAxKQoKd2l0aCBvcGVuKCdQS0dCVUlMRCcsICd3JykgYXMgZjoKICAgIGYud3JpdGUoY29udGVudCkKCnByaW50KCd6bnZlcjQgaG9zdCB0b29sIHdvcmthcm91bmQgaW5qZWN0ZWQuJykK' | base64 -d > /tmp/inject_znver4.py
+          cd build && python3 /tmp/inject_znver4.py
           echo "=== Verification ==="
-          grep "target-list-exclude" PKGBUILD
+          grep -n "build.ninja.bak\|ninja target" PKGBUILD | head -10
 
       - name: Remove static subpackages from PKGBUILD
         run: |
