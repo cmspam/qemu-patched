@@ -14,7 +14,7 @@ env:
   ARCH_GITLAB_API: https://gitlab.archlinux.org/api/v4/projects/archlinux%2Fpackaging%2Fpackages%2Fqemu
 
 jobs:
-  # ── Detect latest Arch QEMU tag (shared between both build jobs) ────────────
+  # ── Detect latest Arch QEMU tag ─────────────────────────────────────────────
   get-version:
     runs-on: ubuntu-latest
     outputs:
@@ -48,7 +48,7 @@ jobs:
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # ── Build job (runs twice in parallel, once per target) ─────────────────────
+  # ── Build jobs (parallel, one per target) ───────────────────────────────────
   build:
     needs: get-version
     if: needs.get-version.outputs.needs_build == 'true'
@@ -57,19 +57,25 @@ jobs:
       contents: write
 
     strategy:
-      fail-fast: false  # if one arch fails, let the other continue
+      fail-fast: false
       matrix:
         include:
           - target: znver4
-            docker_image: cachyos/docker-makepkg-znver4
+            # Both targets use the v3 container since GitHub runners don't
+            # support AVX-512 / znver4 instructions. For znver4 we override
+            # CFLAGS/CXXFLAGS inside the PKGBUILD so the compiled output
+            # targets Zen 4, even though the toolchain itself is v3.
+            docker_image: cachyos/docker-makepkg-v3
+            march_flag: "-march=znver4 -mtune=znver4"
           - target: v3
             docker_image: cachyos/docker-makepkg-v3
+            march_flag: "-march=x86-64-v3 -mtune=generic"
 
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ── Download Arch PKGBUILD files at the latest tag ─────────────────────
+      # ── Download Arch PKGBUILD files ────────────────────────────────────────
       - name: Download Arch QEMU PKGBUILD
         run: |
           TAG="${{ needs.get-version.outputs.tag }}"
@@ -94,7 +100,7 @@ jobs:
             echo "  downloaded: $FILE"
           done
 
-      # ── Download the custom patch ───────────────────────────────────────────
+      # ── Download the custom patch ────────────────────────────────────────────
       - name: Download custom patch
         run: |
           curl -sfL \
@@ -102,27 +108,55 @@ jobs:
             -o build/qemu-all-in-one.patch
           echo "Patch downloaded."
 
-      # ── Inject patch into PKGBUILD ──────────────────────────────────────────
+      # ── Inject custom patch into PKGBUILD ────────────────────────────────────
       - name: Inject patch into PKGBUILD
         run: |
           cp inject_patch.sh build/
           chmod +x build/inject_patch.sh
           cd build && bash inject_patch.sh
+          echo ""
+          echo "=== Verification ==="
+          grep -n "qemu-all-in-one\|^prepare()\|^build()" PKGBUILD | head -20
 
-      # ── Build using CachyOS docker container ───────────────────────────────
+      # ── Inject -march flags into PKGBUILD ────────────────────────────────────
+      # Adds CFLAGS/CXXFLAGS overrides as the first lines of build() so the
+      # compiler always targets the right architecture.
+      - name: Inject march flags into PKGBUILD
+        run: |
+          MARCH="${{ matrix.march_flag }}"
+          cd build
+          perl -i -pe \
+            "s|^(build\(\) \{)\$|\$1\n  export CFLAGS=\"\${CFLAGS} ${MARCH}\"\n  export CXXFLAGS=\"\${CXXFLAGS} ${MARCH}\"|" \
+            PKGBUILD
+          echo "=== march flags injected, build() now starts: ==="
+          grep -A5 "^build()" PKGBUILD | head -8
+
+      # ── Build using the CachyOS docker container ─────────────────────────────
+      # --privileged avoids the kernel landlock sandbox error on GitHub runners.
+      # We refresh both keyrings before building to fix PGP trust failures.
       - name: Build package
         run: |
           cd build
           docker run --rm \
+            --privileged \
             -e EXPORT_PKG=1 \
             -e SYNC_DATABASE=1 \
             -v "$PWD:/pkg" \
-            "${{ matrix.docker_image }}"
+            "${{ matrix.docker_image }}" \
+            bash -c "
+              set -e
+              echo '=== Refreshing keyrings ==='
+              pacman -Sy --noconfirm archlinux-keyring cachyos-keyring 2>/dev/null || true
+              pacman-key --populate archlinux cachyos 2>/dev/null || true
+              echo '=== Starting build ==='
+              exec /entrypoint.sh
+            "
+
           echo ""
           echo "=== Built packages ==="
           ls -lh *.pkg.tar.zst
 
-      # ── Generate pacman database files ─────────────────────────────────────
+      # ── Generate pacman database ─────────────────────────────────────────────
       - name: Generate pacman database
         run: |
           REPO_NAME="qemu-patched-${{ matrix.target }}"
@@ -130,6 +164,7 @@ jobs:
           cp build/*.pkg.tar.zst /tmp/repo/
 
           docker run --rm \
+            --privileged \
             -v /tmp/repo:/repo \
             archlinux:latest \
             bash -c "
@@ -139,12 +174,10 @@ jobs:
               ln -sf ${REPO_NAME}.db.tar.gz ${REPO_NAME}.db
               ln -sf ${REPO_NAME}.files.tar.gz ${REPO_NAME}.files
               echo '=== database files ==='
-              ls -lh *.db* *.files*
+              ls -lh
             "
 
-          echo "Database generated."
-
-      # ── Upload versioned archival release ──────────────────────────────────
+      # ── Create versioned archival release ────────────────────────────────────
       - name: Create versioned release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -152,21 +185,20 @@ jobs:
           TAG="${{ needs.get-version.outputs.tag }}"
           VERSIONED_TAG="${TAG}-${{ matrix.target }}"
 
-          # Remove any existing release with this versioned tag
           gh release delete "$VERSIONED_TAG" --yes 2>/dev/null || true
           git push origin ":refs/tags/$VERSIONED_TAG" 2>/dev/null || true
 
           gh release create "$VERSIONED_TAG" \
             --title "QEMU ${TAG} (${{ matrix.target }})" \
             --notes "Arch Linux QEMU \`${TAG}\` with [qemu-all-in-one.patch](https://github.com/cmspam/qemu-patched) applied.
-          Built with: \`${{ matrix.docker_image }}\`" \
+          Target: \`${{ matrix.march_flag }}\` | Built with: \`${{ matrix.docker_image }}\`" \
             build/*.pkg.tar.zst
 
           echo "Versioned release created: $VERSIONED_TAG"
 
-      # ── Update the stable latest-<target> release ──────────────────────────
-      # This is the release users' pacman.conf points at permanently.
-      # It is deleted and recreated on every build so the URL never changes.
+      # ── Update the stable latest-<target> release ────────────────────────────
+      # This release is always recreated at the same tag so pacman.conf
+      # Server URLs never need to change.
       - name: Update latest release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -175,19 +207,13 @@ jobs:
           LATEST_TAG="latest-${{ matrix.target }}"
           REPO_NAME="qemu-patched-${{ matrix.target }}"
 
-          # Delete existing latest release and its tag
           gh release delete "$LATEST_TAG" --yes 2>/dev/null || true
           git push origin ":refs/tags/$LATEST_TAG" 2>/dev/null || true
-
-          # Collect all files: packages + db files
-          FILES=$(ls build/*.pkg.tar.zst)
-          DB_FILES="/tmp/repo/${REPO_NAME}.db.tar.gz /tmp/repo/${REPO_NAME}.db \
-                    /tmp/repo/${REPO_NAME}.files.tar.gz /tmp/repo/${REPO_NAME}.files"
 
           gh release create "$LATEST_TAG" \
             --title "QEMU latest (${{ matrix.target }}) — ${TAG}" \
             --notes "Latest build: Arch Linux QEMU \`${TAG}\` with [qemu-all-in-one.patch](https://github.com/cmspam/qemu-patched) applied.
-          Built with: \`${{ matrix.docker_image }}\`
+          Target: \`${{ matrix.march_flag }}\` | Built with: \`${{ matrix.docker_image }}\`
 
           ## pacman.conf
 
@@ -196,11 +222,15 @@ jobs:
           SigLevel = Optional
           Server = https://github.com/cmspam/qemu-patched/releases/download/${LATEST_TAG}
           \`\`\`" \
-            $FILES $DB_FILES
+            build/*.pkg.tar.zst \
+            /tmp/repo/${REPO_NAME}.db.tar.gz \
+            /tmp/repo/${REPO_NAME}.db \
+            /tmp/repo/${REPO_NAME}.files.tar.gz \
+            /tmp/repo/${REPO_NAME}.files
 
           echo "Latest release updated: $LATEST_TAG → $TAG"
 
-  # ── Record the built version after both jobs succeed ────────────────────────
+  # ── Record version after both jobs succeed ───────────────────────────────────
   record-version:
     needs: [get-version, build]
     if: needs.get-version.outputs.needs_build == 'true'
@@ -222,7 +252,7 @@ jobs:
           git commit -m "chore: record built version $TAG [skip ci]"
           git push
 
-      - name: Summary
+      - name: Build summary
         run: |
           TAG="${{ needs.get-version.outputs.tag }}"
           echo "### Build complete: QEMU $TAG" >> "$GITHUB_STEP_SUMMARY"
