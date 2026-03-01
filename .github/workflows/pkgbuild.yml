@@ -278,6 +278,8 @@ jobs:
               echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
               chown -R builder:builder /pkg
 
+              echo '=== Importing GPG key for QEMU source tarball ==='
+              sudo -u builder gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys 3353C9CEF108B584
               echo '=== Building package ==='
               cd /pkg
               sudo -u builder makepkg -sf --noconfirm
