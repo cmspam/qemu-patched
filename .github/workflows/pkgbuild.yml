@@ -133,24 +133,29 @@ jobs:
 
       # ── Build using the CachyOS docker container ─────────────────────────────
       # --privileged avoids the kernel landlock sandbox error on GitHub runners.
-      # We refresh both keyrings before building to fix PGP trust failures.
+      # We refresh the keyrings by running a separate container first and
+      # committing the result, so the actual build uses the normal entrypoint
+      # untouched and has up-to-date PGP keys.
       - name: Build package
         run: |
           cd build
+
+          echo '=== Refreshing keyrings ==='
+          docker run --privileged \
+            --name qemu-keyring-refresh \
+            -v "$PWD:/pkg" \
+            "${{ matrix.docker_image }}" \
+            pacman -Sy --noconfirm archlinux-keyring cachyos-keyring 2>/dev/null || true
+          docker commit qemu-keyring-refresh qemu-build-ready
+          docker rm qemu-keyring-refresh
+
+          echo '=== Starting build ==='
           docker run --rm \
             --privileged \
             -e EXPORT_PKG=1 \
             -e SYNC_DATABASE=1 \
             -v "$PWD:/pkg" \
-            "${{ matrix.docker_image }}" \
-            bash -c "
-              set -e
-              echo '=== Refreshing keyrings ==='
-              pacman -Sy --noconfirm archlinux-keyring cachyos-keyring 2>/dev/null || true
-              pacman-key --populate archlinux cachyos 2>/dev/null || true
-              echo '=== Starting build ==='
-              exec /entrypoint.sh
-            "
+            qemu-build-ready
 
           echo ""
           echo "=== Built packages ==="
