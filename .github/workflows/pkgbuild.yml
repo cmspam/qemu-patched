@@ -61,14 +61,10 @@ jobs:
       matrix:
         include:
           - target: znver4
-            # Both targets use the v3 container since GitHub runners don't
-            # support AVX-512 / znver4 instructions. For znver4 we override
-            # CFLAGS/CXXFLAGS inside the PKGBUILD so the compiled output
-            # targets Zen 4, even though the toolchain itself is v3.
-            docker_image: cachyos/docker-makepkg-v3
+            docker_image: cachyos/cachyos-v3
             march_flag: "-march=znver4 -mtune=znver4"
           - target: v3
-            docker_image: cachyos/docker-makepkg-v3
+            docker_image: cachyos/cachyos-v3
             march_flag: "-march=x86-64-v3 -mtune=generic"
 
     steps:
@@ -111,16 +107,31 @@ jobs:
       # ── Inject custom patch into PKGBUILD ────────────────────────────────────
       - name: Inject patch into PKGBUILD
         run: |
-          cp inject_patch.sh build/
-          chmod +x build/inject_patch.sh
-          cd build && bash inject_patch.sh
+          cd build
+
+          PATCH_FILE="qemu-all-in-one.patch"
+          PATCH_SHA256=$(sha256sum "$PATCH_FILE" | awk '{print $1}')
+          echo "Patch sha256: $PATCH_SHA256"
+
+          # Add patch to source array
+          perl -i -0pe 's|(source=\(.*?)(\n\))|$1\n        '"'"'qemu-all-in-one.patch'"'"'$2|s' PKGBUILD
+
+          # Add sha256sum entry
+          perl -i -0pe "s|(sha256sums=\(.*?)(\n\))|\$1\n        '$PATCH_SHA256'\$2|s" PKGBUILD
+
+          # Add patch command to prepare() — create one if it doesn't exist
+          PATCH_CMD="  patch -Np1 -i \"\${srcdir}/qemu-all-in-one.patch\""
+          if grep -q "^prepare()" PKGBUILD; then
+            perl -i -pe "s|^(prepare\(\) \{)\$|\$1\n${PATCH_CMD}|" PKGBUILD
+          else
+            perl -i -0pe "s|(^build\(\))|prepare() {\n${PATCH_CMD}\n}\n\n\$1|m" PKGBUILD
+          fi
+
           echo ""
           echo "=== Verification ==="
           grep -n "qemu-all-in-one\|^prepare()\|^build()" PKGBUILD | head -20
 
       # ── Inject -march flags into PKGBUILD ────────────────────────────────────
-      # Adds CFLAGS/CXXFLAGS overrides as the first lines of build() so the
-      # compiler always targets the right architecture.
       - name: Inject march flags into PKGBUILD
         run: |
           MARCH="${{ matrix.march_flag }}"
@@ -131,41 +142,71 @@ jobs:
           echo "=== march flags injected, build() now starts: ==="
           grep -A5 "^build()" PKGBUILD | head -8
 
-      # ── Build using the CachyOS docker container ─────────────────────────────
-      # --privileged avoids the kernel landlock sandbox error on GitHub runners.
-      # We bake a keyring refresh into a new image layer using docker build so
-      # the actual build runs with the normal /run.sh entrypoint as notroot,
-      # exactly as the container is designed.
-      - name: Build package
+      # ── Remove static subpackages from PKGBUILD ─────────────────────────────
+      # qemu-user-static and qemu-user-static-binfmt require static system
+      # libraries that are not available in CachyOS repos, so we strip them.
+      - name: Remove static subpackages from PKGBUILD
         run: |
           cd build
+          python3 - << 'PYEOF'
+          import re
 
-          echo '=== Building image with refreshed keyrings ==='
-          DOCKER_IMAGE="${{ matrix.docker_image }}"
+          with open('PKGBUILD', 'r') as f:
+              content = f.read()
 
-          docker build --build-arg BASE_IMAGE="${DOCKER_IMAGE}" -t qemu-build-ready - << 'DOCKERFILE'
-          ARG BASE_IMAGE
-          FROM ${BASE_IMAGE}
-          # Receive and trust the CachyOS signing key, then refresh keyrings.
-          # This runs as root during image build, before notroot takes over.
-          RUN pacman-key --recv-keys F3B607488DB35A47 --keyserver keyserver.ubuntu.com && \
-              pacman-key --lsign-key F3B607488DB35A47 && \
-              pacman -Sy --noconfirm archlinux-keyring && \
-              pacman -U --noconfirm 'https://mirror.cachyos.org/repo/x86_64/cachyos/cachyos-keyring-20240331-1-any.pkg.tar.zst' && \
-              pacman-key --populate archlinux cachyos
-          DOCKERFILE
+          # Remove from pkgname array
+          content = re.sub(r"\s+'qemu-user-static'", '', content)
+          content = re.sub(r"\s+'qemu-user-static-binfmt'", '', content)
+          content = re.sub(r"\s+qemu-user-static\b", '', content)
+          content = re.sub(r"\s+qemu-user-static-binfmt\b", '', content)
 
-          echo '=== Starting build ==='
+          # Remove package_qemu-user-static() function block
+          content = re.sub(
+              r'\npackage_qemu-user-static\(\).*?(?=\npackage_|\Z)',
+              '', content, flags=re.DOTALL)
+
+          # Remove package_qemu-user-static-binfmt() function block
+          content = re.sub(
+              r'\npackage_qemu-user-static-binfmt\(\).*?(?=\npackage_|\Z)',
+              '', content, flags=re.DOTALL)
+
+          with open('PKGBUILD', 'w') as f:
+              f.write(content)
+
+          print("Static subpackages removed.")
+          PYEOF
+
+      # ── Build using the CachyOS rolling container ────────────────────────────
+      # cachyos/cachyos-v3 is a regularly updated rolling CachyOS system.
+      # We set up a build user and run makepkg directly — no stale keyrings,
+      # no mystery entrypoints, full control.
+      - name: Build package
+        run: |
           docker run --rm \
             --privileged \
-            -e EXPORT_PKG=1 \
-            -e SYNC_DATABASE=1 \
-            -v "$PWD:/pkg" \
-            qemu-build-ready
+            -v "$PWD/build:/pkg" \
+            "${{ matrix.docker_image }}" \
+            bash -c "
+              set -e
+              echo '=== Updating system ==='
+              pacman -Syu --noconfirm
+
+              echo '=== Installing build dependencies ==='
+              pacman -S --noconfirm --needed base-devel
+
+              echo '=== Setting up build user ==='
+              useradd -m builder
+              echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+              chown -R builder:builder /pkg
+
+              echo '=== Building package ==='
+              cd /pkg
+              sudo -u builder makepkg -sf --noconfirm
+            "
 
           echo ""
           echo "=== Built packages ==="
-          ls -lh *.pkg.tar.zst
+          ls -lh build/*.pkg.tar.zst
 
       # ── Generate pacman database ─────────────────────────────────────────────
       - name: Generate pacman database
@@ -175,9 +216,8 @@ jobs:
           cp build/*.pkg.tar.zst /tmp/repo/
 
           docker run --rm \
-            --privileged \
             -v /tmp/repo:/repo \
-            archlinux:latest \
+            "${{ matrix.docker_image }}" \
             bash -c "
               pacman -Sy --noconfirm --needed pacman 2>&1 | tail -3
               cd /repo
@@ -208,8 +248,6 @@ jobs:
           echo "Versioned release created: $VERSIONED_TAG"
 
       # ── Update the stable latest-<target> release ────────────────────────────
-      # This release is always recreated at the same tag so pacman.conf
-      # Server URLs never need to change.
       - name: Update latest release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
