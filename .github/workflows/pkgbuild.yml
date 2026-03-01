@@ -58,9 +58,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-         # - target: znver4
-         #   docker_image: cachyos/cachyos-v3
-         #   march_flag: "-march=znver4 -mtune=znver4"
+          - target: znver4
+            docker_image: cachyos/cachyos-v3
+            march_flag: "-march=znver4 -mtune=znver4"
           - target: v3
             docker_image: cachyos/cachyos-v3
             march_flag: "-march=x86-64-v3 -mtune=generic"
@@ -100,9 +100,6 @@ jobs:
             -o build/qemu-all-in-one.patch
           echo "Patch downloaded."
 
-      # Inject our patch into source=(), sha512sums=(), b2sums=(), and prepare().
-      # Uses paren-depth tracking to reliably find array closing parens regardless
-      # of how complex the content is (brace expansions, long checksum strings, etc.)
       - name: Inject patch into PKGBUILD
         run: |
           cat > /tmp/inject.py << 'PYEOF'
@@ -161,16 +158,65 @@ jobs:
       - name: Inject march flags into PKGBUILD
         run: |
           MARCH="${{ matrix.march_flag }}"
-          cd build
-          perl -i -pe \
-            "s|^(build\(\) \{)\$|\$1\n  export CFLAGS=\"\${CFLAGS} ${MARCH}\"\n  export CXXFLAGS=\"\${CXXFLAGS} ${MARCH}\"|" \
-            PKGBUILD
-          echo "=== march flags injected ==="
-          grep -A5 "^build()" PKGBUILD | head -8
+          cat > /tmp/inject_march.py << 'PYEOF'
+          import re, sys
 
-      # The real PKGBUILD uses brace expansion: qemu-user{,-static}{,-binfmt}
-      # and has a full static build section. We remove all of it since static
-      # libs are unavailable in CachyOS repos.
+          with open('PKGBUILD', 'r') as f:
+              content = f.read()
+
+          march = sys.argv[1]
+
+          # Append --extra-cflags to the regular (non-static) configure call.
+          pattern = r'(\.\./\$pkgbase-\$pkgver/configure "\$\{configure_options\[@\]\}")'
+          replacement = r'\1 --extra-cflags="' + march + r'" --extra-cxxflags="' + march + r'"'
+          content, n = re.subn(pattern, replacement, content)
+          if n == 0:
+              print('ERROR: configure line not found in PKGBUILD')
+              sys.exit(1)
+
+          with open('PKGBUILD', 'w') as f:
+              f.write(content)
+
+          print('march flags injected:', march)
+          PYEOF
+          cd build && python3 /tmp/inject_march.py "$MARCH"
+          echo "=== Verification ==="
+          grep "configure.*extra-cflags" PKGBUILD
+
+      # idef-parser is a host build tool compiled with our march flags (baked
+      # into config-meson.cross by QEMU's configure). On znver4 it then crashes
+      # immediately when the GitHub runner tries to execute it. Excluding the
+      # hexagon target avoids building idef-parser entirely.
+      # v3 is supported by GitHub runners so hexagon builds fine there.
+      - name: Exclude hexagon target for znver4
+        if: matrix.target == 'znver4'
+        run: |
+          cat > /tmp/inject_no_hexagon.py << 'PYEOF'
+          import sys
+
+          with open('PKGBUILD', 'r') as f:
+              content = f.read()
+
+          marker = '--extra-cflags="-march=znver4 -mtune=znver4" --extra-cxxflags="-march=znver4 -mtune=znver4"'
+          if marker not in content:
+              print('ERROR: march marker not found in PKGBUILD')
+              sys.exit(1)
+
+          content = content.replace(
+              marker,
+              marker + ' --target-list-exclude=hexagon-linux-user',
+              1
+          )
+
+          with open('PKGBUILD', 'w') as f:
+              f.write(content)
+
+          print('hexagon-linux-user excluded for znver4 build')
+          PYEOF
+          cd build && python3 /tmp/inject_no_hexagon.py
+          echo "=== Verification ==="
+          grep "target-list-exclude" PKGBUILD
+
       - name: Remove static subpackages from PKGBUILD
         run: |
           cat > /tmp/remove_static.py << 'PYEOF'
