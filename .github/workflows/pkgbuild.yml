@@ -109,15 +109,12 @@ jobs:
         run: |
           cd build
 
-          PATCH_FILE="qemu-all-in-one.patch"
-          PATCH_SHA256=$(sha256sum "$PATCH_FILE" | awk '{print $1}')
-          echo "Patch sha256: $PATCH_SHA256"
-
           # Add patch to source array
           perl -i -0pe 's|(source=\(.*?)(\n\))|$1\n        '"'"'qemu-all-in-one.patch'"'"'$2|s' PKGBUILD
 
-          # Add sha256sum entry
-          perl -i -0pe "s|(sha256sums=\(.*?)(\n\))|\$1\n        '$PATCH_SHA256'\$2|s" PKGBUILD
+          # Add SKIP to both sha512sums and b2sums — same as upstream does for .sig files
+          perl -i -0pe "s|(sha512sums=\(.*?)(\n\))|\$1\n        'SKIP'\$2|s" PKGBUILD
+          perl -i -0pe "s|(b2sums=\(.*?)(\n\))|\$1\n        'SKIP'\$2|s" PKGBUILD
 
           # Add patch command to prepare() - it already exists in this PKGBUILD
           PATCH_CMD="  patch -Np1 -d \$pkgbase-\$pkgver -i ../qemu-all-in-one.patch"
