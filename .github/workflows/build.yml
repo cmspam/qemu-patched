@@ -1,32 +1,376 @@
-name: "Build and Cache"
+name: Build and Publish QEMU
+
 on:
-  pull_request:
-  push:
   schedule:
-    - cron: '0 3 * * *' # Every night at 3:00 AM
+    - cron: '0 6 * * *'   # 06:00 UTC
+    - cron: '0 18 * * *'  # 18:00 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  ARCH_GITLAB_API: https://gitlab.archlinux.org/api/v4/projects/archlinux%2Fpackaging%2Fpackages%2Fqemu
+
 jobs:
-  build:
+  get-version:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.get_tag.outputs.tag }}
+      needs_build: ${{ steps.check.outputs.needs_build }}
+
     steps:
-    - uses: actions/checkout@v4
-    
-    - name: Install Nix
-      uses: cachix/install-nix-action@v25
-      with:
-        # This ensures flakes are enabled and nixpkgs is mapped correctly
-        nix_path: nixpkgs=channel:nixos-unstable
-        extra_nix_config: |
-          experimental-features = nix-command flakes
+      - name: Checkout repo
+        uses: actions/checkout@v4
 
-    - name: Setup Cachix
-      uses: cachix/cachix-action@v14
-      with:
-        name: cmspam  # <--- DOUBLE CHECK THIS NAME
-        authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
-    
-    - name: Update nixpkgs
-      run: nix flake update
+      - name: Get latest Arch QEMU tag
+        id: get_tag
+        run: |
+          LATEST_TAG=$(curl -sf \
+            "${ARCH_GITLAB_API}/repository/tags?order_by=version&sort=desc&per_page=1" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['name'])")
+          echo "Latest Arch QEMU tag: $LATEST_TAG"
+          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
 
-    - name: Build QEMU
-      # Building .#default is correct as per your flake.nix
-      run: nix build .#default --print-build-logs
+      - name: Check if already built
+        id: check
+        run: |
+          LATEST="${{ steps.get_tag.outputs.tag }}"
+          LAST="$(cat last_built_version.txt 2>/dev/null || echo '')"
+          echo "Last built: '$LAST' | Latest: '$LATEST'"
+          if [[ "$LAST" == "$LATEST" ]]; then
+            echo "Already up to date, skipping build."
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version detected, will build."
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: get-version
+    if: needs.get-version.outputs.needs_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+         # - target: znver4
+         #   docker_image: cachyos/cachyos-v3
+         #   march_flag: "-march=znver4 -mtune=znver4"
+          - target: v3
+            docker_image: cachyos/cachyos-v3
+            march_flag: "-march=x86-64-v3 -mtune=generic"
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Download Arch QEMU PKGBUILD
+        run: |
+          TAG="${{ needs.get-version.outputs.tag }}"
+          mkdir -p build
+
+          FILES=$(curl -sf \
+            "${ARCH_GITLAB_API}/repository/tree?ref=${TAG}" \
+            | python3 -c "
+          import sys, json
+          for f in json.load(sys.stdin):
+              if f['type'] == 'blob':
+                  print(f['name'])
+          ")
+
+          echo "Files in Arch QEMU $TAG:"
+          echo "$FILES"
+
+          for FILE in $FILES; do
+            ENC=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${FILE}', safe=''))")
+            curl -sfL "${ARCH_GITLAB_API}/repository/files/${ENC}/raw?ref=${TAG}" \
+              -o "build/${FILE}"
+            echo "  downloaded: $FILE"
+          done
+
+      - name: Download custom patch
+        run: |
+          curl -sfL \
+            "https://raw.githubusercontent.com/cmspam/qemu-patched/main/qemu-all-in-one.patch" \
+            -o build/qemu-all-in-one.patch
+          echo "Patch downloaded."
+
+      - name: Inject patch into PKGBUILD
+        run: |
+          cat > /tmp/inject.py << 'PYEOF'
+          import sys
+
+          with open('PKGBUILD', 'r') as f:
+              content = f.read()
+
+          def insert_before_closing_paren(content, array_name, value):
+              start = content.find('\n' + array_name + '=(')
+              if start == -1:
+                  start = content.find(array_name + '=(')
+              if start == -1:
+                  print('WARNING: array ' + array_name + ' not found, skipping')
+                  return content
+              i = content.index('(', start)
+              depth = 0
+              in_quote = False
+              while i < len(content):
+                  c = content[i]
+                  if c == "'" and not in_quote:
+                      in_quote = True
+                  elif c == "'" and in_quote:
+                      in_quote = False
+                  elif not in_quote:
+                      if c == '(':
+                          depth += 1
+                      elif c == ')':
+                          depth -= 1
+                          if depth == 0:
+                              return content[:i] + '\n  ' + value + '\n' + content[i:]
+                  i += 1
+              print('WARNING: no closing paren found for ' + array_name)
+              return content
+
+          content = insert_before_closing_paren(content, 'source', 'qemu-all-in-one.patch')
+          content = insert_before_closing_paren(content, 'sha512sums', "'SKIP'")
+          content = insert_before_closing_paren(content, 'b2sums', "'SKIP'")
+
+          patch_cmd = '  patch -Np1 -d $pkgbase-$pkgver -i ../qemu-all-in-one.patch'
+          if '\nprepare() {' in content:
+              content = content.replace('\nprepare() {', '\nprepare() {\n' + patch_cmd, 1)
+          else:
+              content = content.replace('\nbuild() {', '\nprepare() {\n' + patch_cmd + '\n}\n\nbuild() {', 1)
+
+          with open('PKGBUILD', 'w') as f:
+              f.write(content)
+
+          print('Patch injection complete.')
+          PYEOF
+          cd build && python3 /tmp/inject.py
+
+          echo "=== Verification ==="
+          grep -n "qemu-all-in-one\|^prepare()\|^build()" PKGBUILD | head -20
+
+      - name: Inject march flags into PKGBUILD
+        run: |
+          MARCH="${{ matrix.march_flag }}"
+          cat > /tmp/inject_march.py << 'PYEOF'
+          import re, sys
+
+          with open('PKGBUILD', 'r') as f:
+              content = f.read()
+
+          march = sys.argv[1]
+
+          # Append --extra-cflags to the regular (non-static) configure call.
+          pattern = r'(\.\./\$pkgbase-\$pkgver/configure "\$\{configure_options\[@\]\}")'
+          replacement = r'\1 --extra-cflags="' + march + r'" --extra-cxxflags="' + march + r'"'
+          content, n = re.subn(pattern, replacement, content)
+          if n == 0:
+              print('ERROR: configure line not found in PKGBUILD')
+              sys.exit(1)
+
+          with open('PKGBUILD', 'w') as f:
+              f.write(content)
+
+          print('march flags injected:', march)
+          PYEOF
+          cd build && python3 /tmp/inject_march.py "$MARCH"
+          echo "=== Verification ==="
+          grep "configure.*extra-cflags" PKGBUILD
+
+      - name: Remove static subpackages from PKGBUILD
+        run: |
+          cat > /tmp/remove_static.py << 'PYEOF'
+          import re, sys
+
+          with open('PKGBUILD', 'r') as f:
+              content = f.read()
+
+          # 1. Replace brace-expansion pkgname line, keeping only non-static variants
+          content = re.sub(
+              r'\s+qemu-user\{,-static\}\{,-binfmt\}',
+              '\n  qemu-user\n  qemu-user-binfmt',
+              content
+          )
+
+          # 2. Remove qemu-user-static optdepends line
+          content = re.sub(r"\s+'qemu-user-static:[^']*'", '', content)
+
+          # 3. Remove build-static directory creation from prepare()
+          content = re.sub(r'\n  mkdir -vp build-static\n', '\n', content)
+
+          # 4. Remove the static configure options array from build()
+          content = re.sub(
+              r'\n  local configure_static_options=\(.*?\n  \)\n',
+              '\n', content, flags=re.DOTALL)
+
+          # 5. Remove the static build subshell from build()
+          content = re.sub(
+              r'\n  \(\n    cd build-static\n.*?\n  \)\n',
+              '\n', content, flags=re.DOTALL)
+
+          # 6. Remove the static install block from package_qemu-common()
+          content = re.sub(
+              r'\n  # install static binaries\n  meson install -C build-static.*?# install default binaries\n',
+              '\n  # install default binaries\n',
+              content, flags=re.DOTALL)
+
+          # 7. Remove _pick lines for static packages (handles leading whitespace)
+          content = re.sub(r'^[ \t]*_pick qemu-user-static[ \t].*\n', '', content, flags=re.MULTILINE)
+          content = re.sub(r'^[ \t]*_pick qemu-user-static-binfmt[ \t].*\n', '', content, flags=re.MULTILINE)
+
+          # 8. Remove package_qemu-user-static() function block
+          content = re.sub(
+              r'\npackage_qemu-user-static\(\)\s*\{.*?\n\}\n',
+              '\n', content, flags=re.DOTALL)
+
+          # 9. Remove package_qemu-user-static-binfmt() function block
+          content = re.sub(
+              r'\npackage_qemu-user-static-binfmt\(\)\s*\{.*?\n\}\n',
+              '\n', content, flags=re.DOTALL)
+
+          with open('PKGBUILD', 'w') as f:
+              f.write(content)
+
+          remaining = [l for l in content.splitlines() if 'user-static' in l]
+          if remaining:
+              print('ERROR: user-static still present:')
+              for l in remaining:
+                  print(' ', repr(l))
+              sys.exit(1)
+          else:
+              print('Static subpackages cleanly removed.')
+          PYEOF
+          cd build && python3 /tmp/remove_static.py
+
+      - name: Build package
+        run: |
+          docker run --rm \
+            --privileged \
+            -v "$PWD/build:/pkg" \
+            "${{ matrix.docker_image }}" \
+            bash -c "
+              set -e
+              echo '=== Updating system ==='
+              pacman -Syu --noconfirm
+
+              echo '=== Installing build dependencies ==='
+              pacman -S --noconfirm --needed base-devel
+              echo '=== Setting up build user ==='
+              useradd -m builder
+              echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
+              chown -R builder:builder /pkg
+              echo '=== Importing GPG Key ==='
+              sudo -u builder gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys 3353C9CEF108B584
+              echo '=== Building package ==='
+              cd /pkg
+              sudo -u builder makepkg -sf --noconfirm
+            "
+
+          echo ""
+          echo "=== Built packages ==="
+          ls -lh build/*.pkg.tar.zst
+
+      - name: Generate pacman database
+        run: |
+          REPO_NAME="qemu-patched-${{ matrix.target }}"
+          mkdir -p /tmp/repo
+          cp build/*.pkg.tar.zst /tmp/repo/
+
+          docker run --rm \
+            -v /tmp/repo:/repo \
+            "${{ matrix.docker_image }}" \
+            bash -c "
+              pacman -Sy --noconfirm --needed pacman 2>&1 | tail -3
+              cd /repo
+              repo-add ${REPO_NAME}.db.tar.gz *.pkg.tar.zst
+              ln -sf ${REPO_NAME}.db.tar.gz ${REPO_NAME}.db
+              ln -sf ${REPO_NAME}.files.tar.gz ${REPO_NAME}.files
+              echo '=== database files ==='
+              ls -lh
+            "
+
+      - name: Create versioned release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.get-version.outputs.tag }}"
+          VERSIONED_TAG="${TAG}-${{ matrix.target }}"
+
+          gh release delete "$VERSIONED_TAG" --yes 2>/dev/null || true
+          git push origin ":refs/tags/$VERSIONED_TAG" 2>/dev/null || true
+
+          gh release create "$VERSIONED_TAG" \
+            --title "QEMU ${TAG} (${{ matrix.target }})" \
+            --notes "Arch Linux QEMU \`${TAG}\` with [qemu-all-in-one.patch](https://github.com/cmspam/qemu-patched) applied.
+          Target: \`${{ matrix.march_flag }}\` | Built with: \`${{ matrix.docker_image }}\`" \
+            build/*.pkg.tar.zst
+
+          echo "Versioned release created: $VERSIONED_TAG"
+
+      - name: Update latest release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.get-version.outputs.tag }}"
+          LATEST_TAG="latest-${{ matrix.target }}"
+          REPO_NAME="qemu-patched-${{ matrix.target }}"
+
+          gh release delete "$LATEST_TAG" --yes 2>/dev/null || true
+          git push origin ":refs/tags/$LATEST_TAG" 2>/dev/null || true
+
+          gh release create "$LATEST_TAG" \
+            --title "QEMU latest (${{ matrix.target }}) — ${TAG}" \
+            --notes "Latest build: Arch Linux QEMU \`${TAG}\` with [qemu-all-in-one.patch](https://github.com/cmspam/qemu-patched) applied.
+          Target: \`${{ matrix.march_flag }}\` | Built with: \`${{ matrix.docker_image }}\`
+
+          ## pacman.conf
+
+          \`\`\`ini
+          [${REPO_NAME}]
+          SigLevel = Optional
+          Server = https://github.com/cmspam/qemu-patched/releases/download/${LATEST_TAG}
+          \`\`\`" \
+            build/*.pkg.tar.zst \
+            /tmp/repo/${REPO_NAME}.db.tar.gz \
+            /tmp/repo/${REPO_NAME}.db \
+            /tmp/repo/${REPO_NAME}.files.tar.gz \
+            /tmp/repo/${REPO_NAME}.files
+
+          echo "Latest release updated: $LATEST_TAG → $TAG"
+
+  record-version:
+    needs: [get-version, build]
+    if: needs.get-version.outputs.needs_build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Record built version
+        run: |
+          TAG="${{ needs.get-version.outputs.tag }}"
+          echo "$TAG" > last_built_version.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add last_built_version.txt
+          git commit -m "chore: record built version $TAG [skip ci]"
+          git push
+
+      - name: Build summary
+        run: |
+          TAG="${{ needs.get-version.outputs.tag }}"
+          echo "### Build complete: QEMU $TAG" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Target | Release |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|--------|---------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| znver4 | [latest-znver4](https://github.com/cmspam/qemu-patched/releases/tag/latest-znver4) |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| v3     | [latest-v3](https://github.com/cmspam/qemu-patched/releases/tag/latest-v3) |" >> "$GITHUB_STEP_SUMMARY"
