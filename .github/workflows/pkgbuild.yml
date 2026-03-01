@@ -58,9 +58,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: znver4
-            docker_image: cachyos/cachyos-v3
-            march_flag: "-march=znver4 -mtune=znver4"
+         # - target: znver4
+         #   docker_image: cachyos/cachyos-v3
+         #   march_flag: "-march=znver4 -mtune=znver4"
           - target: v3
             docker_image: cachyos/cachyos-v3
             march_flag: "-march=x86-64-v3 -mtune=generic"
