@@ -58,9 +58,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-         # - target: znver4
-         #   docker_image: cachyos/cachyos-v3
-         #   march_flag: "-march=znver4 -mtune=znver4"
+          - target: znver4
+            docker_image: cachyos/cachyos-v3
+            march_flag: "-march=znver4 -mtune=znver4"
           - target: v3
             docker_image: cachyos/cachyos-v3
             march_flag: "-march=x86-64-v3 -mtune=generic"
@@ -162,11 +162,16 @@ jobs:
         run: |
           MARCH="${{ matrix.march_flag }}"
           cd build
+          # Use --extra-cflags on the configure call rather than injecting into
+          # CFLAGS/CXXFLAGS globally. QEMU's configure is a meson wrapper and
+          # --extra-cflags is scoped to target compilation only — host build
+          # tools like idef-parser are compiled without it, so they can run on
+          # the GitHub runner regardless of target architecture.
           perl -i -pe \
-            "s|^(build\(\) \{)\$|\$1\n  export CFLAGS=\"\${CFLAGS} ${MARCH}\"\n  export CXXFLAGS=\"\${CXXFLAGS} ${MARCH}\"|" \
+            "s|(\.\./\$pkgbase-\$pkgver/configure "\$\{configure_options\[\@\]\}")|\$1 --extra-cflags=\"${MARCH}\" --extra-cxxflags=\"${MARCH}\"|" \
             PKGBUILD
           echo "=== march flags injected ==="
-          grep -A5 "^build()" PKGBUILD | head -8
+          grep "configure.*extra-cflags" PKGBUILD
 
       # The real PKGBUILD uses brace expansion: qemu-user{,-static}{,-binfmt}
       # and has a full static build section. We remove all of it since static
@@ -249,12 +254,12 @@ jobs:
 
               echo '=== Installing build dependencies ==='
               pacman -S --noconfirm --needed base-devel
+
               echo '=== Setting up build user ==='
               useradd -m builder
               echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
               chown -R builder:builder /pkg
-              echo '=== Importing GPG Key ==='
-              sudo -u builder gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys 3353C9CEF108B584
+
               echo '=== Building package ==='
               cd /pkg
               sudo -u builder makepkg -sf --noconfirm
