@@ -14,7 +14,6 @@ env:
   ARCH_GITLAB_API: https://gitlab.archlinux.org/api/v4/projects/archlinux%2Fpackaging%2Fpackages%2Fqemu
 
 jobs:
-  # ── Detect latest Arch QEMU tag ─────────────────────────────────────────────
   get-version:
     runs-on: ubuntu-latest
     outputs:
@@ -48,7 +47,6 @@ jobs:
             echo "needs_build=true" >> "$GITHUB_OUTPUT"
           fi
 
-  # ── Build jobs (parallel, one per target) ───────────────────────────────────
   build:
     needs: get-version
     if: needs.get-version.outputs.needs_build == 'true'
@@ -71,7 +69,6 @@ jobs:
       - name: Checkout repo
         uses: actions/checkout@v4
 
-      # ── Download Arch PKGBUILD files ────────────────────────────────────────
       - name: Download Arch QEMU PKGBUILD
         run: |
           TAG="${{ needs.get-version.outputs.tag }}"
@@ -96,7 +93,6 @@ jobs:
             echo "  downloaded: $FILE"
           done
 
-      # ── Download the custom patch ────────────────────────────────────────────
       - name: Download custom patch
         run: |
           curl -sfL \
@@ -104,31 +100,64 @@ jobs:
             -o build/qemu-all-in-one.patch
           echo "Patch downloaded."
 
-      # ── Inject custom patch into PKGBUILD ────────────────────────────────────
+      # Inject our patch into source=(), sha512sums=(), b2sums=(), and prepare().
+      # Uses paren-depth tracking to reliably find array closing parens regardless
+      # of how complex the content is (brace expansions, long checksum strings, etc.)
       - name: Inject patch into PKGBUILD
         run: |
-          cd build
+          cat > /tmp/inject.py << 'PYEOF'
+          import sys
 
-          # Add patch to source array
-          perl -i -0pe 's|(source=\(.*?)(\n\))|$1\n        '"'"'qemu-all-in-one.patch'"'"'$2|s' PKGBUILD
+          with open('PKGBUILD', 'r') as f:
+              content = f.read()
 
-          # Add SKIP to both sha512sums and b2sums — same as upstream does for .sig files
-          perl -i -0pe "s|(sha512sums=\(.*?)(\n\))|\$1\n        'SKIP'\$2|s" PKGBUILD
-          perl -i -0pe "s|(b2sums=\(.*?)(\n\))|\$1\n        'SKIP'\$2|s" PKGBUILD
+          def insert_before_closing_paren(content, array_name, value):
+              start = content.find('\n' + array_name + '=(')
+              if start == -1:
+                  start = content.find(array_name + '=(')
+              if start == -1:
+                  print('WARNING: array ' + array_name + ' not found, skipping')
+                  return content
+              i = content.index('(', start)
+              depth = 0
+              in_quote = False
+              while i < len(content):
+                  c = content[i]
+                  if c == "'" and not in_quote:
+                      in_quote = True
+                  elif c == "'" and in_quote:
+                      in_quote = False
+                  elif not in_quote:
+                      if c == '(':
+                          depth += 1
+                      elif c == ')':
+                          depth -= 1
+                          if depth == 0:
+                              return content[:i] + '\n  ' + value + '\n' + content[i:]
+                  i += 1
+              print('WARNING: no closing paren found for ' + array_name)
+              return content
 
-          # Add patch command to prepare() - it already exists in this PKGBUILD
-          PATCH_CMD="  patch -Np1 -d \$pkgbase-\$pkgver -i ../qemu-all-in-one.patch"
-          if grep -q "^prepare()" PKGBUILD; then
-            perl -i -pe "s|^(prepare\(\) \{)$|\$1\n${PATCH_CMD}|" PKGBUILD
-          else
-            perl -i -0pe "s|(^build\(\))|prepare() {\n${PATCH_CMD}\n}\n\n\$1|m" PKGBUILD
-          fi
+          content = insert_before_closing_paren(content, 'source', 'qemu-all-in-one.patch')
+          content = insert_before_closing_paren(content, 'sha512sums', "'SKIP'")
+          content = insert_before_closing_paren(content, 'b2sums', "'SKIP'")
 
-          echo ""
+          patch_cmd = '  patch -Np1 -d $pkgbase-$pkgver -i ../qemu-all-in-one.patch'
+          if '\nprepare() {' in content:
+              content = content.replace('\nprepare() {', '\nprepare() {\n' + patch_cmd, 1)
+          else:
+              content = content.replace('\nbuild() {', '\nprepare() {\n' + patch_cmd + '\n}\n\nbuild() {', 1)
+
+          with open('PKGBUILD', 'w') as f:
+              f.write(content)
+
+          print('Patch injection complete.')
+          PYEOF
+          cd build && python3 /tmp/inject.py
+
           echo "=== Verification ==="
           grep -n "qemu-all-in-one\|^prepare()\|^build()" PKGBUILD | head -20
 
-      # ── Inject -march flags into PKGBUILD ────────────────────────────────────
       - name: Inject march flags into PKGBUILD
         run: |
           MARCH="${{ matrix.march_flag }}"
@@ -136,18 +165,15 @@ jobs:
           perl -i -pe \
             "s|^(build\(\) \{)\$|\$1\n  export CFLAGS=\"\${CFLAGS} ${MARCH}\"\n  export CXXFLAGS=\"\${CXXFLAGS} ${MARCH}\"|" \
             PKGBUILD
-          echo "=== march flags injected, build() now starts: ==="
+          echo "=== march flags injected ==="
           grep -A5 "^build()" PKGBUILD | head -8
 
-      # ── Remove static subpackages from PKGBUILD ──────────────────────────────
-      # qemu-user-static and qemu-user-static-binfmt require static system
-      # libraries unavailable in CachyOS repos. The real PKGBUILD uses brace
-      # expansion on a single line: qemu-user{,-static}{,-binfmt}
-      # so each case must be handled precisely rather than filtering lines.
+      # The real PKGBUILD uses brace expansion: qemu-user{,-static}{,-binfmt}
+      # and has a full static build section. We remove all of it since static
+      # libs are unavailable in CachyOS repos.
       - name: Remove static subpackages from PKGBUILD
         run: |
-          cd build
-          python3 << 'PYEOF'
+          cat > /tmp/remove_static.py << 'PYEOF'
           import re, sys
 
           with open('PKGBUILD', 'r') as f:
@@ -199,21 +225,17 @@ jobs:
           with open('PKGBUILD', 'w') as f:
               f.write(content)
 
-          # Verify nothing remains
           remaining = [l for l in content.splitlines() if 'user-static' in l]
           if remaining:
-              print("ERROR: user-static still present in PKGBUILD:")
+              print('ERROR: user-static still present:')
               for l in remaining:
-                  print(" ", repr(l))
+                  print(' ', repr(l))
               sys.exit(1)
           else:
-              print("Static subpackages cleanly removed.")
+              print('Static subpackages cleanly removed.')
           PYEOF
+          cd build && python3 /tmp/remove_static.py
 
-      # ── Build using the CachyOS rolling container ────────────────────────────
-      # cachyos/cachyos-v3 is a regularly updated rolling CachyOS system.
-      # We set up a build user and run makepkg directly — no stale keyrings,
-      # no mystery entrypoints, full control.
       - name: Build package
         run: |
           docker run --rm \
@@ -242,7 +264,6 @@ jobs:
           echo "=== Built packages ==="
           ls -lh build/*.pkg.tar.zst
 
-      # ── Generate pacman database ─────────────────────────────────────────────
       - name: Generate pacman database
         run: |
           REPO_NAME="qemu-patched-${{ matrix.target }}"
@@ -262,7 +283,6 @@ jobs:
               ls -lh
             "
 
-      # ── Create versioned archival release ────────────────────────────────────
       - name: Create versioned release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -281,7 +301,6 @@ jobs:
 
           echo "Versioned release created: $VERSIONED_TAG"
 
-      # ── Update the stable latest-<target> release ────────────────────────────
       - name: Update latest release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -313,7 +332,6 @@ jobs:
 
           echo "Latest release updated: $LATEST_TAG → $TAG"
 
-  # ── Record version after both jobs succeed ───────────────────────────────────
   record-version:
     needs: [get-version, build]
     if: needs.get-version.outputs.needs_build == 'true'
