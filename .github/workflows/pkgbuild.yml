@@ -167,10 +167,24 @@ jobs:
           # --extra-cflags is scoped to target compilation only — host build
           # tools like idef-parser are compiled without it, so they can run on
           # the GitHub runner regardless of target architecture.
-          perl -i -pe \
-            "s|(\.\./\$pkgbase-\$pkgver/configure "\$\{configure_options\[\@\]\}")|\$1 --extra-cflags=\"${MARCH}\" --extra-cxxflags=\"${MARCH}\"|" \
-            PKGBUILD
-          echo "=== march flags injected ==="
+          # We use Python here because the @] in configure_options[@] causes
+          # perl to choke on the regex regardless of escaping.
+          python3 -c "
+          import re, sys
+          with open('PKGBUILD', 'r') as f:
+              content = f.read()
+          march = sys.argv[1]
+          pattern = r'(\.\./\$pkgbase-\$pkgver/configure \"\$\{configure_options\[\@\]\}\")' 
+          replacement = r'\1 --extra-cflags=\"' + march + r'\" --extra-cxxflags=\"' + march + r'\"'
+          content, n = re.subn(pattern, replacement, content)
+          if n == 0:
+              print('ERROR: configure line not found in PKGBUILD')
+              sys.exit(1)
+          with open('PKGBUILD', 'w') as f:
+              f.write(content)
+          print('march flags injected:', march)
+          " "$MARCH"
+          echo "=== Verification ==="
           grep "configure.*extra-cflags" PKGBUILD
 
       # The real PKGBUILD uses brace expansion: qemu-user{,-static}{,-binfmt}
