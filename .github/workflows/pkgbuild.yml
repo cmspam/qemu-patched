@@ -119,10 +119,10 @@ jobs:
           # Add sha256sum entry
           perl -i -0pe "s|(sha256sums=\(.*?)(\n\))|\$1\n        '$PATCH_SHA256'\$2|s" PKGBUILD
 
-          # Add patch command to prepare() — create one if it doesn't exist
-          PATCH_CMD="  patch -Np1 -i \"\${srcdir}/qemu-all-in-one.patch\""
+          # Add patch command to prepare() - it already exists in this PKGBUILD
+          PATCH_CMD="  patch -Np1 -d \$pkgbase-\$pkgver -i ../qemu-all-in-one.patch"
           if grep -q "^prepare()" PKGBUILD; then
-            perl -i -pe "s|^(prepare\(\) \{)\$|\$1\n${PATCH_CMD}|" PKGBUILD
+            perl -i -pe "s|^(prepare\(\) \{)$|\$1\n${PATCH_CMD}|" PKGBUILD
           else
             perl -i -0pe "s|(^build\(\))|prepare() {\n${PATCH_CMD}\n}\n\n\$1|m" PKGBUILD
           fi
@@ -142,38 +142,75 @@ jobs:
           echo "=== march flags injected, build() now starts: ==="
           grep -A5 "^build()" PKGBUILD | head -8
 
-      # ── Remove static subpackages from PKGBUILD ─────────────────────────────
+      # ── Remove static subpackages from PKGBUILD ──────────────────────────────
       # qemu-user-static and qemu-user-static-binfmt require static system
-      # libraries that are not available in CachyOS repos, so we strip them.
+      # libraries unavailable in CachyOS repos. The real PKGBUILD uses brace
+      # expansion on a single line: qemu-user{,-static}{,-binfmt}
+      # so each case must be handled precisely rather than filtering lines.
       - name: Remove static subpackages from PKGBUILD
         run: |
           cd build
-          python3 - << 'PYEOF'
-          import re
+          python3 << 'PYEOF'
+          import re, sys
 
           with open('PKGBUILD', 'r') as f:
               content = f.read()
 
-          # Remove from pkgname array
-          content = re.sub(r"\s+'qemu-user-static'", '', content)
-          content = re.sub(r"\s+'qemu-user-static-binfmt'", '', content)
-          content = re.sub(r"\s+qemu-user-static\b", '', content)
-          content = re.sub(r"\s+qemu-user-static-binfmt\b", '', content)
-
-          # Remove package_qemu-user-static() function block
+          # 1. Replace brace-expansion pkgname line, keeping only non-static variants
           content = re.sub(
-              r'\npackage_qemu-user-static\(\).*?(?=\npackage_|\Z)',
-              '', content, flags=re.DOTALL)
+              r'\s+qemu-user\{,-static\}\{,-binfmt\}',
+              '\n  qemu-user\n  qemu-user-binfmt',
+              content
+          )
 
-          # Remove package_qemu-user-static-binfmt() function block
+          # 2. Remove qemu-user-static optdepends line
+          content = re.sub(r"\s+'qemu-user-static:[^']*'", '', content)
+
+          # 3. Remove build-static directory creation from prepare()
+          content = re.sub(r'\n  mkdir -vp build-static\n', '\n', content)
+
+          # 4. Remove the static configure options array from build()
           content = re.sub(
-              r'\npackage_qemu-user-static-binfmt\(\).*?(?=\npackage_|\Z)',
-              '', content, flags=re.DOTALL)
+              r'\n  local configure_static_options=\(.*?\n  \)\n',
+              '\n', content, flags=re.DOTALL)
+
+          # 5. Remove the static build subshell from build()
+          content = re.sub(
+              r'\n  \(\n    cd build-static\n.*?\n  \)\n',
+              '\n', content, flags=re.DOTALL)
+
+          # 6. Remove the static install block from package_qemu-common()
+          content = re.sub(
+              r'\n  # install static binaries\n  meson install -C build-static.*?# install default binaries\n',
+              '\n  # install default binaries\n',
+              content, flags=re.DOTALL)
+
+          # 7. Remove _pick lines for static packages (handles leading whitespace)
+          content = re.sub(r'^[ \t]*_pick qemu-user-static[ \t].*\n', '', content, flags=re.MULTILINE)
+          content = re.sub(r'^[ \t]*_pick qemu-user-static-binfmt[ \t].*\n', '', content, flags=re.MULTILINE)
+
+          # 8. Remove package_qemu-user-static() function block
+          content = re.sub(
+              r'\npackage_qemu-user-static\(\)\s*\{.*?\n\}\n',
+              '\n', content, flags=re.DOTALL)
+
+          # 9. Remove package_qemu-user-static-binfmt() function block
+          content = re.sub(
+              r'\npackage_qemu-user-static-binfmt\(\)\s*\{.*?\n\}\n',
+              '\n', content, flags=re.DOTALL)
 
           with open('PKGBUILD', 'w') as f:
               f.write(content)
 
-          print("Static subpackages removed.")
+          # Verify nothing remains
+          remaining = [l for l in content.splitlines() if 'user-static' in l]
+          if remaining:
+              print("ERROR: user-static still present in PKGBUILD:")
+              for l in remaining:
+                  print(" ", repr(l))
+              sys.exit(1)
+          else:
+              print("Static subpackages cleanly removed.")
           PYEOF
 
       # ── Build using the CachyOS rolling container ────────────────────────────
