@@ -249,7 +249,7 @@ jobs:
 
               echo '=== Installing build dependencies ==='
               pacman -S --noconfirm --needed base-devel
-
+              gpg --batch --recv-keys 3353C9CEF108B584
               echo '=== Setting up build user ==='
               useradd -m builder
               echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
