@@ -19,6 +19,7 @@
           # The missing semicolon was here!
           patches = (oldAttrs.patches or [ ]) ++ [
             ./qemu-all-in-one.patch
+            ./qemu-pat-option.patch
           ];
         });
       };
