@@ -40,6 +40,11 @@
 
           src = qemu-src;
 
+          patches = (oldAttrs.patches or [ ]) ++ [
+            ./qemu-all-in-one.patch
+          ];
+
+
           preConfigure = ''
             touch .git
             mkdir -p subprojects
