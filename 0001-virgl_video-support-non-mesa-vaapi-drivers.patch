@@ -1,5 +1,5 @@
 --- virglrenderer-main/src/vrend/virgl_video.h	2026-03-26 15:55:06.000000000 +0000
-+++ virglrenderer-patched/src/vrend/virgl_video.h	2026-03-31 13:47:10.451274506 +0000
++++ virglrenderer-patched/src/vrend/virgl_video.h	2026-03-31 13:47:10.000000000 +0000
 @@ -72,9 +72,30 @@
      uint32_t width;
      uint32_t height;
@@ -32,8 +32,17 @@
  #define VIRGL_VIDEO_DMABUF_READ_ONLY        0x0001
  #define VIRGL_VIDEO_DMABUF_WRITE_ONLY       0x0002
 --- virglrenderer-main/src/vrend/virgl_video.c	2026-03-26 15:55:06.000000000 +0000
-+++ virglrenderer-patched/src/vrend/virgl_video.c	2026-03-31 13:49:12.169234033 +0000
-@@ -88,6 +88,28 @@
++++ virglrenderer-patched/src/vrend/virgl_video.c	2026-03-31 14:16:11.727510696 +0000
+@@ -67,6 +67,8 @@
+ #include <epoxy/egl.h>
+ #include <va/va.h>
+ #include <va/va_drm.h>
++#include <xf86drm.h>
++#include <fcntl.h>
+ #include <va/va_drmcommon.h>
+ #include <drm_fourcc.h>
+ 
+@@ -88,6 +90,28 @@
  #define CODED_BUF_DEFAULT_SIZE(width, height) \
      ((width) * (height) / (16 * 16) * 512)
  
@@ -62,7 +71,7 @@
  struct virgl_video_buffer {
      enum pipe_format format;
      uint32_t width;
-@@ -109,6 +131,7 @@
+@@ -109,6 +133,7 @@
     uint32_t max_references;
     VAContextID va_ctx;
     VAConfigID  va_cfg;
@@ -70,7 +79,21 @@
     struct virgl_video_buffer *buffer;
     struct virgl_video_buffer *ref_pic_list[32]; /* Enc: reference pictures */
     VABufferID  va_coded_buf;                    /* Enc: VACodedBuffer */
-@@ -166,7 +189,7 @@
+@@ -122,6 +147,13 @@
+ 
+ static VADisplay va_dpy;
+ 
++/*
++ * If virgl_video_init() opens its own DRM fd (because the provided one is a
++ * virtual/unsuitable device), we track it here so virgl_video_destroy() can
++ * close it.
++ */
++static int va_own_drm_fd = -1;
++
+ static struct virgl_video_callbacks *callbacks = NULL;
+ 
+ static enum pipe_video_profile pipe_profile_from_va(VAProfile profile)
+@@ -166,7 +198,7 @@
     }
  }
  
@@ -79,7 +102,7 @@
  static enum pipe_video_entrypoint pipe_entrypoint_from_va(
          VAEntrypoint entrypoint)
  {
-@@ -282,12 +305,32 @@
+@@ -282,12 +314,32 @@
      case PIPE_VIDEO_ENTRYPOINT_MC:
          return VAEntrypointMoComp;
      case PIPE_VIDEO_ENTRYPOINT_ENCODE:
@@ -112,7 +135,7 @@
  static uint32_t va_format_from_pipe(uint32_t format)
  {
      uint32_t va_format;
-@@ -526,7 +569,7 @@
+@@ -526,7 +578,7 @@
      idx = frame_num % ARRAY_SIZE(codec->ref_pic_list);
  
      if (!codec->ref_pic_list[idx]) {
@@ -121,10 +144,141 @@
          args.width = codec->width;
          args.height = codec->height;
          args.interlaced = 0;
-@@ -541,6 +584,65 @@
+@@ -541,31 +593,282 @@
      return codec->ref_pic_list[idx]->va_sfc;
  }
  
++/*
++ * DRM driver names that indicate a virtual/software GPU with no real
++ * hardware video decode capability.
++ */
++static const char * const virgl_virtual_drm_drivers[] = {
++    "virtio_gpu", "virtio-gpu", "virt", "vmwgfx",
++    "qxl", "bochs-drm", "cirrus", "ast", NULL
++};
++
++/*
++ * Return true if the DRM device behind fd is a virtual/software device.
++ * These cannot do real hardware VA-API decode.
++ */
++static bool virgl_drm_is_virtual(int fd)
++{
++    bool result = true;  /* Assume virtual if we can't determine */
++    drmVersionPtr ver;
++
++    if (fd < 0)
++        return true;
++
++    ver = drmGetVersion(fd);
++    if (!ver)
++        return true;
++
++    result = false;
++    for (int i = 0; virgl_virtual_drm_drivers[i]; i++) {
++        if (strcasecmp(ver->name, virgl_virtual_drm_drivers[i]) == 0) {
++            result = true;
++            break;
++        }
++    }
++
++    virgl_info("DRM device driver: %s (%s)\n", ver->name,
++               result ? "virtual" : "hardware");
++    drmFreeVersion(ver);
++    return result;
++}
++
++/*
++ * Return true if fd is an Intel GPU (i915 or xe kernel driver).
++ * Used to prefer the iHD VA driver over Mesa for correct decode behaviour.
++ */
++static bool virgl_drm_is_intel(int fd)
++{
++    bool result = false;
++    drmVersionPtr ver;
++
++    if (fd < 0)
++        return false;
++
++    ver = drmGetVersion(fd);
++    if (!ver)
++        return false;
++
++    if (strcasecmp(ver->name, "i915") == 0 ||
++        strcasecmp(ver->name, "xe") == 0)
++        result = true;
++
++    drmFreeVersion(ver);
++    return result;
++}
++
++/*
++ * Try to find a hardware DRM render node suitable for VA-API.
++ *
++ * Strategy (in order):
++ *   1. If VIRGL_VIDEO_DRM_DEVICE is set, use that path explicitly.
++ *   2. Scan /dev/dri/renderD128..191 for non-virtual devices.
++ *      For Intel GPUs, prefer iHD over Mesa by calling vaSetDriverName().
++ *
++ * Returns an open fd on success (-1 on failure).
++ * The caller owns the fd and must close it.
++ */
++static int virgl_find_hw_drm_device(void)
++{
++    const char *override = getenv("VIRGL_VIDEO_DRM_DEVICE");
++
++    if (override) {
++        int fd = open(override, O_RDWR | O_CLOEXEC);
++        if (fd >= 0) {
++            virgl_info("using VIRGL_VIDEO_DRM_DEVICE=%s\n", override);
++            return fd;
++        }
++        virgl_error("cannot open VIRGL_VIDEO_DRM_DEVICE=%s: %m\n", override);
++        return -1;
++    }
++
++    for (int i = 128; i < 192; i++) {
++        char path[32];
++        snprintf(path, sizeof(path), "/dev/dri/renderD%d", i);
++
++        int fd = open(path, O_RDWR | O_CLOEXEC);
++        if (fd < 0)
++            continue;
++
++        if (virgl_drm_is_virtual(fd)) {
++            close(fd);
++            continue;
++        }
++
++        /* Quick VA-API probe to confirm the device is usable */
++        VADisplay probe = vaGetDisplayDRM(fd);
++        if (!probe) {
++            close(fd);
++            continue;
++        }
++
++        /* For Intel GPUs, try to force iHD before probing */
++        if (virgl_drm_is_intel(fd)) {
++#if VA_CHECK_VERSION(1, 0, 0)
++            vaSetDriverName(probe, "iHD");
++#endif
++        }
++
++        int major, minor;
++        if (vaInitialize(probe, &major, &minor) == VA_STATUS_SUCCESS) {
++            const char *vendor = vaQueryVendorString(probe);
++            virgl_info("selected HW VA device %s: %s\n",
++                       path, vendor ? vendor : "<unknown>");
++            vaTerminate(probe);
++            return fd;
++        }
++
++        vaTerminate(probe);
++        close(fd);
++    }
++
++    return -1;
++}
++
 +/*
 + * Classify the VA driver from its vendor string.
 + * Called once during virgl_video_init().
@@ -187,7 +341,98 @@
  int virgl_video_init(int drm_fd,
                       struct virgl_video_callbacks *cbs, unsigned int flags)
  {
-@@ -573,12 +675,24 @@
+     VAStatus va_stat;
+     int major_ver, minor_ver;
+     const char *driver;
++    int use_fd;
+ 
+     (void)flags;
+ 
+-    if (drm_fd < 0) {
+-        virgl_error("invalid drm fd: %d\n", drm_fd);
+-        return -1;
++    /*
++     * If the provided DRM fd points to a virtual/software device (e.g.
++     * virtio_gpu in a QEMU/virgl host context), real hardware VA-API decode
++     * is impossible through it.  Scan for a real GPU render node instead.
++     *
++     * The VIRGL_VIDEO_DRM_DEVICE environment variable can pin a specific node
++     * (e.g. "VIRGL_VIDEO_DRM_DEVICE=/dev/dri/renderD128") to skip scanning.
++     */
++    if (virgl_drm_is_virtual(drm_fd)) {
++        virgl_info("provided DRM fd is virtual — scanning for real HW device\n");
++        int hw_fd = virgl_find_hw_drm_device();
++        if (hw_fd < 0) {
++            virgl_error("no hardware VA-API device found; video unavailable\n");
++            return -1;
++        }
++        va_own_drm_fd = hw_fd;
++        use_fd = hw_fd;
++    } else {
++        use_fd = drm_fd;
+     }
+ 
+-    va_dpy = vaGetDisplayDRM(drm_fd);
++    va_dpy = vaGetDisplayDRM(use_fd);
+     if (!va_dpy) {
+         virgl_error("get va display failed\n");
+         return -1;
+     }
+ 
++    /*
++     * Prefer Intel iHD over Mesa for Intel GPU devices.
++     * Mesa's iris VA frontend on Xe hardware may produce surfaces with
++     * Intel-specific tiling modifiers that the guest virgl renderer cannot
++     * import correctly, resulting in a green screen or memory corruption.
++     * iHD can also export linear NV12 which travels through DMA-BUF cleanly.
++     */
++    if (virgl_drm_is_intel(use_fd)) {
++#if VA_CHECK_VERSION(1, 0, 0)
++        virgl_info("Intel GPU detected — requesting iHD VA driver\n");
++        vaSetDriverName(va_dpy, "iHD");
++#else
++        /* Older libva: fall back to LIBVA_DRIVER_NAME env var */
++        if (!getenv("LIBVA_DRIVER_NAME")) {
++            virgl_info("Intel GPU: set LIBVA_DRIVER_NAME=iHD for best results\n");
++        }
++#endif
++    }
++
+     va_stat = vaInitialize(va_dpy, &major_ver, &minor_ver);
+     if (VA_STATUS_SUCCESS != va_stat) {
+-        virgl_error("init va library failed\n");
++        virgl_error("init va library failed (err 0x%x)\n", va_stat);
++#if VA_CHECK_VERSION(1, 0, 0)
++        /*
++         * iHD may refuse the device in some configurations.
++         * Retry with auto-detection so Mesa or another driver can take over.
++         */
++        if (virgl_drm_is_intel(use_fd)) {
++            virgl_info("iHD init failed, retrying with auto-detected VA driver\n");
++            vaTerminate(va_dpy);
++            va_dpy = vaGetDisplayDRM(use_fd);
++            if (!va_dpy) {
++                virgl_error("get va display (retry) failed\n");
++                return -1;
++            }
++            va_stat = vaInitialize(va_dpy, &major_ver, &minor_ver);
++            if (VA_STATUS_SUCCESS != va_stat) {
++                virgl_error("init va library (retry) failed\n");
++                virgl_video_destroy();
++                return -1;
++            }
++        } else {
++            virgl_video_destroy();
++            return -1;
++        }
++#else
+         virgl_video_destroy();
+         return -1;
++#endif
+     }
+ 
+     virgl_info("VA-API version: %d.%d\n", major_ver, minor_ver);
+@@ -573,12 +876,24 @@
      driver = vaQueryVendorString(va_dpy);
      virgl_info("Driver version: %s\n", driver ? driver : "<unknown>");
  
@@ -216,7 +461,19 @@
      callbacks = cbs;
  
      return 0;
-@@ -602,11 +716,16 @@
+@@ -591,6 +906,11 @@
+         va_dpy = NULL;
+     }
+ 
++    if (va_own_drm_fd >= 0) {
++        close(va_own_drm_fd);
++        va_own_drm_fd = -1;
++    }
++
+     callbacks = NULL;
+ }
+ 
+@@ -602,11 +922,16 @@
          {VAProfileMPEG2Simple,  {VAEntrypointVLD, 0}},
          {VAProfileMPEG2Main,    {VAEntrypointVLD, 0}},
          {VAProfileH264ConstrainedBaseline,
@@ -238,7 +495,7 @@
          {VAProfileJPEGBaseline, {VAEntrypointVLD, 0}},
          {VAProfileVC1Simple,    {VAEntrypointVLD, 0}},
          {VAProfileVC1Main,      {VAEntrypointVLD, 0}},
-@@ -762,9 +881,32 @@
+@@ -762,9 +1087,32 @@
      attr.type = VAConfigAttribRTFormat;
      vaGetConfigAttributes(va_dpy, profile, entrypoint, &attr, 1);
      if (!(attr.value & format)) {
@@ -274,7 +531,7 @@
      }
  
      va_stat = vaCreateConfig(va_dpy, profile, entrypoint, &attr, 1, &cfg);
-@@ -790,8 +932,10 @@
+@@ -790,8 +1138,10 @@
      codec->height = args->height;
      codec->max_references = args->max_references;
      codec->opaque = args->opaque;
@@ -286,7 +543,7 @@
          vaCreateBuffer(va_dpy, codec->va_ctx, VAEncCodedBufferType,
                         CODED_BUF_DEFAULT_SIZE(codec->width, codec->height),
                         1, NULL, &codec->va_coded_buf);
-@@ -850,8 +994,25 @@
+@@ -850,8 +1200,25 @@
      if (!buffer)
          return NULL;
  
@@ -314,7 +571,7 @@
      if (VA_STATUS_SUCCESS != va_stat) {
          free(buffer);
          return NULL;
-@@ -989,8 +1150,12 @@
+@@ -989,8 +1356,12 @@
          pic->BottomFieldOrderCnt = desc->field_order_cnt_list[i][1];
      }
  
@@ -329,7 +586,7 @@
      ITEM_SET(vapp, &desc->pps.sps, bit_depth_luma_minus8);
      ITEM_SET(vapp, &desc->pps.sps, bit_depth_chroma_minus8);
      ITEM_SET(vapp, desc, num_ref_frames);
-@@ -1045,44 +1210,89 @@
+@@ -1045,44 +1416,89 @@
  }
  
  /*
@@ -451,7 +708,7 @@
  }
  
  /*
-@@ -1251,21 +1461,34 @@
+@@ -1251,21 +1667,34 @@
  
      //seq_parameter_set_id;
      param->level_idc = codec->level;
@@ -495,7 +752,7 @@
      ITEM_SET(&param->seq_fields.bits, &desc->seq, pic_order_cnt_type);
      //seq_fields.bit.log2_max_pic_order_cnt_lsb_minus4
      //seq_fields.bit.delta_pic_order_always_zero_flag
-@@ -1384,32 +1607,46 @@
+@@ -1384,32 +1813,46 @@
      unsigned i;
      int err = 0;
      VAStatus va_stat;
@@ -551,7 +808,7 @@
      }
  
      va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &pic_param_buf, 1);
-@@ -1426,18 +1663,17 @@
+@@ -1426,18 +1869,17 @@
          goto err;
      }
  
@@ -578,7 +835,7 @@
              err = -1;
          }
      }
-@@ -1445,9 +1681,11 @@
+@@ -1445,9 +1887,11 @@
  err:
      vaDestroyBuffer(va_dpy, pic_param_buf);
      vaDestroyBuffer(va_dpy, iq_matrix_buf);
