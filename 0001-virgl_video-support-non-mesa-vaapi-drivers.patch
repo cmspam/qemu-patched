@@ -1,91 +1,38 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: virglrenderer patch <virglrenderer@patch>
-Date: Tue, 31 Mar 2026 00:00:00 +0000
-Subject: [PATCH] virgl_video: support non-Mesa VA-API drivers (Intel xe/iHD, NVIDIA, etc.)
-
-The current implementation contains a hard guard in virgl_video_init()
-that rejects any VA driver whose vendor string does not contain "Mesa
-Gallium", making hardware video acceleration impossible on Intel iHD/xe,
-NVIDIA's nvidia-vaapi-driver, and any other conformant libva back-end.
-
-Beyond the obvious guard, a deeper audit reveals five additional
-Intel-specific blockers that were hidden by the guard never being reached:
-
-  1. h264_fill_picture_param(): picture_width_in_mbs_minus1 and
-     picture_height_in_mbs_minus1 were commented out.  Intel iHD / xe
-     requires them for decode; other drivers tolerate 0.
-
-  2. h264_fill_enc_seq_param(): intra_period, ip_period,
-     picture_width_in_mbs, picture_height_in_mbs, chroma_format_idc,
-     frame_mbs_only_flag, direct_8x8_inference_flag, and
-     log2_max_frame_num_minus4 were all left as commented-out stubs.
-     Intel iHD / xe requires all of them to be populated for encode.
-
-  3. get_enc_ref_pic(): encoder reference picture surfaces were created
-     with PIPE_FORMAT_NV21.  Intel iHD / xe does not support NV21; the
-     correct format is NV12 (supported by every VA-API driver).
-
-  4. virgl_video_create_buffer(): vaCreateSurfaces() was called without
-     VASurfaceAttribUsageHint.  Intel iHD / xe requires this attribute
-     (DECODER or ENCODER) on every surface or vaBeginPicture() fails
-     with VA_STATUS_ERROR_INVALID_SURFACE.  A new usage_hint field in
-     virgl_video_create_buffer_args carries the value; other drivers
-     safely ignore the attribute.
-
-  5. VAEntrypointEncSliceLP (low-power encode) was absent from the
-     is_supported() table and from va_entrypoint_from_pipe().  Intel xe
-     exposes encode primarily through this entrypoint.  va_entrypoint_from_pipe()
-     now prefers EncSliceLP on Intel and EncSlice elsewhere, and
-     virgl_video_create_codec() falls back automatically between the two
-     if the RT format check fails for the primary choice.
-
-No build-system changes are required.  When -Dvideo=true is set the
-patch is unconditionally active for all conformant VA-API drivers.
-
-Signed-off-by: virglrenderer patch <virglrenderer@patch>
----
- src/vrend/virgl_video.c | 249 +++++++++++++++++++++++++++++++++++++--
- src/vrend/virgl_video.h |  36 ++++++
- 2 files changed, 271 insertions(+), 14 deletions(-)
-
---- virglrenderer-main/src/vrend/virgl_video.h
-+++ virglrenderer-patched/src/vrend/virgl_video.h
-@@ -72,9 +72,33 @@
+--- virglrenderer-main/src/vrend/virgl_video.h	2026-03-26 15:55:06.000000000 +0000
++++ virglrenderer-patched/src/vrend/virgl_video.h	2026-03-31 13:47:10.451274506 +0000
+@@ -72,9 +72,30 @@
      uint32_t width;
      uint32_t height;
      bool interlaced;
 +    /*
-+     * VA surface usage hint.  Set to one of the VIRGL_VA_USAGE_HINT_* values
-+     * below to let the driver allocate the surface with the appropriate memory
-+     * layout.  Required on Intel iHD / xe driver (omitting it causes
-+     * vaBeginPicture() to fail).  Other drivers safely ignore the attribute.
-+     * Pass 0 when no hint is needed (Mesa / unknown drivers).
++     * VA surface usage hint — pass one of the VIRGL_VA_USAGE_HINT_* values
++     * to allow Intel iHD/xe to allocate the surface with the right memory
++     * layout.  Other drivers silently ignore the attribute.  Pass 0 when
++     * the usage is unknown (the attribute is then omitted entirely).
 +     */
 +    uint32_t usage_hint;
      void *opaque;
  };
  
 +/*
-+ * Aliases for VASurfaceAttribUsageHint so callers do not need <va/va.h>.
-+ * When <va/va.h> is already included its own constants take precedence.
++ * Aliases for VASurfaceAttribUsageHint so callers don't need <va/va.h>.
++ * If <va/va.h> is already included its own constants take precedence.
 + */
 +#ifndef VA_SURFACE_ATTRIB_USAGE_HINT_DECODER
-+# define VIRGL_VA_USAGE_HINT_DECODER   0x00000001u
-+# define VIRGL_VA_USAGE_HINT_ENCODER   0x00000002u
-+# define VIRGL_VA_USAGE_HINT_VPP_READ  0x00000004u
-+# define VIRGL_VA_USAGE_HINT_GENERIC   0x00000100u
++# define VIRGL_VA_USAGE_HINT_DECODER  0x00000001u
++# define VIRGL_VA_USAGE_HINT_ENCODER  0x00000002u
++# define VIRGL_VA_USAGE_HINT_GENERIC  0x00000100u
 +#else
-+# define VIRGL_VA_USAGE_HINT_DECODER   VA_SURFACE_ATTRIB_USAGE_HINT_DECODER
-+# define VIRGL_VA_USAGE_HINT_ENCODER   VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER
-+# define VIRGL_VA_USAGE_HINT_VPP_READ  VA_SURFACE_ATTRIB_USAGE_HINT_VPP_READ
-+# define VIRGL_VA_USAGE_HINT_GENERIC   VA_SURFACE_ATTRIB_USAGE_HINT_GENERIC
++# define VIRGL_VA_USAGE_HINT_DECODER  VA_SURFACE_ATTRIB_USAGE_HINT_DECODER
++# define VIRGL_VA_USAGE_HINT_ENCODER  VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER
++# define VIRGL_VA_USAGE_HINT_GENERIC  VA_SURFACE_ATTRIB_USAGE_HINT_GENERIC
 +#endif
 +
  /* flags for virgl_video_dma_buffers */
  #define VIRGL_VIDEO_DMABUF_READ_ONLY        0x0001
  #define VIRGL_VIDEO_DMABUF_WRITE_ONLY       0x0002
---- virglrenderer-main/src/vrend/virgl_video.c
-+++ virglrenderer-patched/src/vrend/virgl_video.c
+--- virglrenderer-main/src/vrend/virgl_video.c	2026-03-26 15:55:06.000000000 +0000
++++ virglrenderer-patched/src/vrend/virgl_video.c	2026-03-31 13:49:12.169234033 +0000
 @@ -88,6 +88,28 @@
  #define CODED_BUF_DEFAULT_SIZE(width, height) \
      ((width) * (height) / (16 * 16) * 512)
@@ -94,10 +41,10 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
 + * Driver family detected once in virgl_video_init() from the VA vendor string.
 + */
 +enum virgl_va_driver_family {
-+    VIRGL_VA_DRIVER_MESA    = 0,   /* Mesa Gallium (radeonsi, nouveau, ...)     */
-+    VIRGL_VA_DRIVER_INTEL,         /* Intel iHD Driver for Intel Gen / Xe       */
-+    VIRGL_VA_DRIVER_NVIDIA,        /* nvidia-vaapi-driver / VDPAU bridge        */
-+    VIRGL_VA_DRIVER_UNKNOWN,       /* Any other conformant libva back-end        */
++    VIRGL_VA_DRIVER_MESA    = 0,  /* Mesa Gallium (radeonsi, nouveau, ...) */
++    VIRGL_VA_DRIVER_INTEL,        /* Intel iHD Driver for Intel Gen / Xe   */
++    VIRGL_VA_DRIVER_NVIDIA,       /* nvidia-vaapi-driver / VDPAU bridge    */
++    VIRGL_VA_DRIVER_UNKNOWN,      /* Any other conformant libva back-end   */
 +};
 +
 +static enum virgl_va_driver_family va_driver_family = VIRGL_VA_DRIVER_UNKNOWN;
@@ -119,32 +66,27 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
     uint32_t max_references;
     VAContextID va_ctx;
     VAConfigID  va_cfg;
-+   int         va_entrypoint;               /* actual VA entrypoint chosen (may differ from pipe) */
++   int         va_entrypoint;    /* actual VA entrypoint chosen */
     struct virgl_video_buffer *buffer;
     struct virgl_video_buffer *ref_pic_list[32]; /* Enc: reference pictures */
     VABufferID  va_coded_buf;                    /* Enc: VACodedBuffer */
-@@ -166,7 +189,11 @@
+@@ -166,7 +189,7 @@
     }
  }
  
 -/* NOTE: mesa va frontend only supports VLD and EncSlice */
-+/*
-+ * Both VAEntrypointEncSlice (full-rate) and VAEntrypointEncSliceLP (low-power)
-+ * map to PIPE_VIDEO_ENTRYPOINT_ENCODE.  The actual entrypoint to use is chosen
-+ * in va_entrypoint_from_pipe() based on driver capability probing.
-+ */
++/* Both VAEntrypointEncSlice and VAEntrypointEncSliceLP map to ENCODE. */
  static enum pipe_video_entrypoint pipe_entrypoint_from_va(
          VAEntrypoint entrypoint)
  {
-@@ -282,12 +309,38 @@
+@@ -282,12 +305,32 @@
      case PIPE_VIDEO_ENTRYPOINT_MC:
          return VAEntrypointMoComp;
      case PIPE_VIDEO_ENTRYPOINT_ENCODE:
 +        /*
-+         * Intel iHD / xe driver exposes encode through VAEntrypointEncSliceLP
-+         * (low-power path).  For other drivers prefer VAEntrypointEncSlice.
-+         * virgl_video_create_codec() will fall back automatically if the
-+         * primary choice is not supported for a specific profile.
++         * Intel iHD/xe exposes encode primarily through EncSliceLP.
++         * For other drivers, prefer EncSlice (traditional full-rate path).
++         * virgl_video_create_codec() will fall back automatically when needed.
 +         */
 +        if (va_driver_family == VIRGL_VA_DRIVER_INTEL &&
 +            (va_encode_caps & VA_ENC_CAP_ENCSLICE_LP))
@@ -155,40 +97,31 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
      }
  }
  
-+/*
-+ * Return the alternate encode entrypoint to try if the primary one fails.
-+ * Returns VAEntrypointNone when no alternative is available.
-+ */
++/* Alternate encode entrypoint to try if the primary one fails. */
 +static int va_encode_entrypoint_fallback(int primary)
 +{
 +    if (primary == VAEntrypointEncSlice &&
 +        (va_encode_caps & VA_ENC_CAP_ENCSLICE_LP))
 +        return VAEntrypointEncSliceLP;
-+
 +    if (primary == VAEntrypointEncSliceLP &&
 +        (va_encode_caps & VA_ENC_CAP_ENCSLICE))
 +        return VAEntrypointEncSlice;
-+
 +    return VAEntrypointNone;
 +}
 +
  static uint32_t va_format_from_pipe(uint32_t format)
  {
      uint32_t va_format;
-@@ -526,7 +579,11 @@
+@@ -526,7 +569,7 @@
      idx = frame_num % ARRAY_SIZE(codec->ref_pic_list);
  
      if (!codec->ref_pic_list[idx]) {
 -        args.format = PIPE_FORMAT_NV21;
-+        /*
-+         * NV21 is not supported by Intel iHD / xe driver.  NV12 is the
-+         * universal YUV 4:2:0 format supported by all VA-API drivers.
-+         */
-+        args.format = PIPE_FORMAT_NV12;
++        args.format = PIPE_FORMAT_NV12;  /* NV21 not supported by Intel iHD/xe */
          args.width = codec->width;
          args.height = codec->height;
          args.interlaced = 0;
-@@ -541,6 +598,75 @@
+@@ -541,6 +584,65 @@
      return codec->ref_pic_list[idx]->va_sfc;
  }
  
@@ -204,22 +137,13 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
 +    if (strstr(vendor, "Mesa Gallium"))
 +        return VIRGL_VA_DRIVER_MESA;
 +
-+    /*
-+     * Intel iHD (Gen9+) and Xe driver:
-+     *   "Intel iHD Driver for Intel(R) Gen Graphics - <ver>"
-+     * Intel legacy i965:
-+     *   "Intel i965 driver for Intel(R) <platform> - <ver>"
-+     */
++    /* Intel iHD (Gen9+) and Xe driver */
 +    if (strstr(vendor, "Intel iHD Driver") ||
 +        strstr(vendor, "Intel i965 driver") ||
 +        strstr(vendor, "Intel(R)"))
 +        return VIRGL_VA_DRIVER_INTEL;
 +
-+    /*
-+     * nvidia-vaapi-driver (ruinland / elFarto):
-+     *   "Splitted-Desktop Systems VDPAU backend for VA-API - <ver>"
-+     * Some builds report "NVIDIA" directly.
-+     */
++    /* nvidia-vaapi-driver / VDPAU bridge */
 +    if (strstr(vendor, "VDPAU") || strstr(vendor, "NVIDIA"))
 +        return VIRGL_VA_DRIVER_NVIDIA;
 +
@@ -228,8 +152,7 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
 +
 +/*
 + * Probe which encode entrypoints the driver actually exposes.
-+ * Uses H.264 High as the reference profile - every HW encoder supports it.
-+ * Populates va_encode_caps.
++ * Uses H.264 High as reference — every HW encoder supports it.
 + */
 +static void virgl_video_probe_encode_caps(void)
 +{
@@ -264,7 +187,7 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
  int virgl_video_init(int drm_fd,
                       struct virgl_video_callbacks *cbs, unsigned int flags)
  {
-@@ -573,14 +699,25 @@
+@@ -573,12 +675,24 @@
      driver = vaQueryVendorString(va_dpy);
      virgl_info("Driver version: %s\n", driver ? driver : "<unknown>");
  
@@ -291,11 +214,9 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
  
 +    virgl_video_probe_encode_caps();
      callbacks = cbs;
--
-     return 0;
- }
  
-@@ -602,11 +739,16 @@
+     return 0;
+@@ -602,11 +716,16 @@
          {VAProfileMPEG2Simple,  {VAEntrypointVLD, 0}},
          {VAProfileMPEG2Main,    {VAEntrypointVLD, 0}},
          {VAProfileH264ConstrainedBaseline,
@@ -317,7 +238,7 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
          {VAProfileJPEGBaseline, {VAEntrypointVLD, 0}},
          {VAProfileVC1Simple,    {VAEntrypointVLD, 0}},
          {VAProfileVC1Main,      {VAEntrypointVLD, 0}},
-@@ -762,9 +904,34 @@
+@@ -762,9 +881,32 @@
      attr.type = VAConfigAttribRTFormat;
      vaGetConfigAttributes(va_dpy, profile, entrypoint, &attr, 1);
      if (!(attr.value & format)) {
@@ -325,10 +246,8 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
 -                  format, attr.value);
 -        goto err;
 +        /*
-+         * The preferred entrypoint does not support this RT format.
-+         * Try the alternate encode entrypoint before giving up - this
-+         * handles Intel xe where some profiles expose only EncSlice or
-+         * only EncSliceLP, and AMD/Mesa where the inverse is true.
++         * The preferred entrypoint doesn't support this RT format.
++         * Try the alternate encode entrypoint before giving up.
 +         */
 +        int alt = VAEntrypointNone;
 +        if (args->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE)
@@ -355,11 +274,11 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
      }
  
      va_stat = vaCreateConfig(va_dpy, profile, entrypoint, &attr, 1, &cfg);
-@@ -790,8 +957,10 @@
+@@ -790,8 +932,10 @@
      codec->height = args->height;
      codec->max_references = args->max_references;
      codec->opaque = args->opaque;
-+    codec->va_entrypoint = entrypoint; /* record actual entrypoint used */
++    codec->va_entrypoint = entrypoint;   /* record actual entrypoint used */
  
 -    if (entrypoint == VAEntrypointEncSlice) {
 +    if (entrypoint == VAEntrypointEncSlice ||
@@ -367,65 +286,180 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
          vaCreateBuffer(va_dpy, codec->va_ctx, VAEncCodedBufferType,
                         CODED_BUF_DEFAULT_SIZE(codec->width, codec->height),
                         1, NULL, &codec->va_coded_buf);
-@@ -836,6 +1005,8 @@
-     VASurfaceID sfc;
-     uint32_t format;
-     struct virgl_video_buffer *buffer;
-+    VASurfaceAttrib attribs[2];
-+    unsigned num_attribs = 0;
- 
-     if (!va_dpy || !args)
-         return NULL;
-@@ -850,8 +1021,23 @@
+@@ -850,8 +994,25 @@
      if (!buffer)
          return NULL;
  
-+    /*
-+     * Intel iHD / xe driver requires VASurfaceAttribUsageHint to be set on
-+     * every surface or vaBeginPicture() / vaRenderPicture() will fail with
-+     * VA_STATUS_ERROR_INVALID_SURFACE.  The hint is ignored by Mesa and other
-+     * drivers so it is safe to pass on all platforms when usage_hint != 0.
-+     */
-+    if (args->usage_hint != 0) {
-+        attribs[num_attribs].type          = VASurfaceAttribUsageHint;
-+        attribs[num_attribs].flags         = VA_SURFACE_ATTRIB_SETTABLE;
-+        attribs[num_attribs].value.type    = VAGenericValueTypeInteger;
-+        attribs[num_attribs].value.value.i = (int)args->usage_hint;
-+        num_attribs++;
-+    }
-+
-     va_stat = vaCreateSurfaces(va_dpy, format,
+-    va_stat = vaCreateSurfaces(va_dpy, format,
 -                               args->width, args->height, &sfc, 1, NULL, 0);
-+                               args->width, args->height, &sfc, 1,
-+                               num_attribs ? attribs : NULL, num_attribs);
++    {
++        VASurfaceAttrib attribs[1];
++        unsigned num_attribs = 0;
++        /*
++         * Intel iHD/xe requires VASurfaceAttribUsageHint on every surface or
++         * vaBeginPicture() fails with VA_STATUS_ERROR_INVALID_SURFACE.
++         * The attribute is harmless on Mesa and other drivers.
++         */
++        if (args->usage_hint != 0) {
++            attribs[0].type          = VASurfaceAttribUsageHint;
++            attribs[0].flags         = VA_SURFACE_ATTRIB_SETTABLE;
++            attribs[0].value.type    = VAGenericValueTypeInteger;
++            attribs[0].value.value.i = (int)args->usage_hint;
++            num_attribs = 1;
++        }
++        va_stat = vaCreateSurfaces(va_dpy, format,
++                                   args->width, args->height, &sfc, 1,
++                                   num_attribs ? attribs : NULL, num_attribs);
++    }
      if (VA_STATUS_SUCCESS != va_stat) {
          free(buffer);
          return NULL;
-@@ -989,8 +1175,12 @@
+@@ -989,8 +1150,12 @@
          pic->BottomFieldOrderCnt = desc->field_order_cnt_list[i][1];
      }
  
 -    //vapp->picture_width_in_mbs_minus1  = (codec->width - 1) / 16;
 -    //vapp->picture_height_in_mbs_minus1 = (codec->height - 1) / 16;
 +    /*
-+     * Intel iHD / xe driver requires these two fields to be populated;
-+     * other drivers tolerate 0 but also accept valid values.
++     * Intel iHD/xe requires these to be populated for correct surface sizing.
++     * Other drivers tolerate 0 but also accept valid values.
 +     */
 +    vapp->picture_width_in_mbs_minus1  = (codec->width  + 15) / 16 - 1;
 +    vapp->picture_height_in_mbs_minus1 = (codec->height + 15) / 16 - 1;
      ITEM_SET(vapp, &desc->pps.sps, bit_depth_luma_minus8);
      ITEM_SET(vapp, &desc->pps.sps, bit_depth_chroma_minus8);
      ITEM_SET(vapp, desc, num_ref_frames);
-@@ -1251,21 +1441,35 @@
+@@ -1045,44 +1210,89 @@
+ }
+ 
+ /*
+- * Refer to vlVaHandleSliceParameterBufferH264() in mesa,
+- * and comment out some unused parameters.
++ * Find the bit offset from the beginning of a raw H.264 NAL buffer to the
++ * first byte of the slice header RBSP (i.e., past start-code + NAL header).
++ *
++ * VA-API's slice_data_bit_offset should point to the end of the slice header
++ * (first macroblock data).  We cannot know that without parsing the full
++ * slice header, but skipping the NAL unit byte is sufficient for Intel iHD/xe
++ * which re-parses the header internally.  Mesa is lenient and accepts 0.
++ */
++static uint32_t h264_nal_header_bit_offset(const uint8_t *buf, uint32_t size)
++{
++    uint32_t off = 0;
++
++    if (!buf || size < 2)
++        return 0;
++
++    /* Detect and skip Annex-B start code: 00 00 00 01  or  00 00 01 */
++    if (size >= 4 && buf[0] == 0 && buf[1] == 0 && buf[2] == 0 && buf[3] == 1)
++        off = 4;
++    else if (size >= 3 && buf[0] == 0 && buf[1] == 0 && buf[2] == 1)
++        off = 3;
++
++    /* Skip NAL unit header byte (forbidden_zero_bit + nal_ref_idc + nal_unit_type) */
++    off += 1;
++
++    return off * 8;  /* return in bits */
++}
++
++/*
++ * Fill one VASliceParameterBufferH264 for the slice whose raw data is
++ * (buf, size).  RefPicList0/1 are built from the picture descriptor so
++ * that Intel iHD/xe can locate reference surfaces for inter prediction.
++ *
++ * Called once per buffer (= per NALU) in h264_decode_bitstream().
+  */
+ static void h264_fill_slice_param(const struct virgl_h264_picture_desc *desc,
++                                  const void *buf, uint32_t size,
+                                   VASliceParameterBufferH264 *vasp)
+ {
+-    //vasp->slice_data_size;
+-    //vasp->slice_data_offset;
+-    //vasp->slice_data_flag;
+-    //vasp->slice_data_bit_offset;
+-    //vasp->first_mb_in_slice;
+-    //vasp->slice_type;
+-    //vasp->direct_spatial_mv_pred_flag;
++    unsigned i;
++
++    /* --- Bitstream location within the slice-data buffer --- */
++    vasp->slice_data_size   = size;
++    vasp->slice_data_offset = 0;
++    vasp->slice_data_flag   = VA_SLICE_DATA_FLAG_ALL;
++
++    /*
++     * Bit offset from the start of the buffer to the first slice-header byte
++     * (past start-code prefix and NAL unit type byte).  Intel iHD/xe uses
++     * this to locate the header; Mesa ignores it.
++     */
++    vasp->slice_data_bit_offset =
++        h264_nal_header_bit_offset((const uint8_t *)buf, size);
++
++    /* --- Active reference frame counts --- */
+     ITEM_SET(vasp, desc, num_ref_idx_l0_active_minus1);
+     ITEM_SET(vasp, desc, num_ref_idx_l1_active_minus1);
+-    //vasp->cabac_init_idc;
+-    //vasp->slice_qp_delta;
+-    //vasp->disable_deblocking_filter_idc;
+-    //vasp->slice_alpha_c0_offset_div2;
+-    //vasp->slice_beta_offset_div2;
+-    //vasp->RefPicList0[32];
+-    //vasp->RefPicList1[32];
+-
+-    /* see pred_weight_table */
+-    //vasp->luma_log2_weight_denom;
+-    //vasp->chroma_log2_weight_denom;
+-    //vasp->luma_weight_l0_flag;
+-    //vasp->luma_weight_l0[32];
+-    //vasp->luma_offset_l0[32];
+-    //vasp->chroma_weight_l0_flag;
+-    //vasp->chroma_weight_l0[32][2];
+-    //vasp->chroma_offset_l0[32][2];
+-    //vasp->luma_weight_l1_flag;
+-    //vasp->luma_weight_l1[32];
+-    //vasp->luma_offset_l1[32];
+-    //vasp->chroma_weight_l1_flag;
+-    //vasp->chroma_weight_l1[32][2];
+-    //vasp->chroma_offset_l1[32][2];
++
++    /*
++     * Build RefPicList0 and RefPicList1 from the per-frame reference table
++     * provided by the guest.  All reference frames go into both lists; the
++     * hardware uses only as many as num_ref_idx_l{0,1}_active_minus1 + 1.
++     * This is correct for P-frames; B-frames with asymmetric lists will
++     * have reduced quality but will not crash.
++     */
++    for (i = 0; i < 32; i++) {
++        h264_init_picture(&vasp->RefPicList0[i]);
++        h264_init_picture(&vasp->RefPicList1[i]);
++    }
++
++    for (i = 0; i < desc->num_ref_frames && i < 32; i++) {
++        VAPictureH264 *p0 = &vasp->RefPicList0[i];
++        VAPictureH264 *p1 = &vasp->RefPicList1[i];
++
++        p0->picture_id = desc->buffer_id[i];
++        p0->frame_idx  = desc->frame_num_list[i];
++        p0->flags      = desc->is_long_term[i]
++                         ? VA_PICTURE_H264_LONG_TERM_REFERENCE
++                         : VA_PICTURE_H264_SHORT_TERM_REFERENCE;
++        p0->TopFieldOrderCnt    = desc->field_order_cnt_list[i][0];
++        p0->BottomFieldOrderCnt = desc->field_order_cnt_list[i][1];
++
++        *p1 = *p0;  /* mirror into L1 */
++    }
+ }
+ 
+ /*
+@@ -1251,21 +1461,34 @@
  
      //seq_parameter_set_id;
      param->level_idc = codec->level;
 -    //intra_period;
 +    /*
-+     * intra_period and ip_period are required by Intel iHD / xe driver.
-+     * The guest H.264 encode descriptor does not carry a separate intra_period
-+     * field, so derive it from intra_idr_period.  ip_period defaults to 1
-+     * (P-frames only; B-frames are not yet supported).
++     * intra_period and ip_period are required by Intel iHD/xe.
++     * Derive intra_period from intra_idr_period; ip_period defaults to 1
++     * (P-frames only; B-frame support is not yet plumbed through).
 +     */
 +    param->intra_period     = desc->intra_idr_period;
      param->intra_idr_period = desc->intra_idr_period;
@@ -436,8 +470,8 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
 -    //picture_width_in_mbs;
 -    //picture_height_in_mbs;
 +    /*
-+     * picture_width_in_mbs and picture_height_in_mbs are required by
-+     * Intel iHD / xe driver for encode sequence parameter setup.
++     * picture_width_in_mbs and picture_height_in_mbs are required by Intel
++     * iHD/xe for encode sequence parameter setup.
 +     */
 +    param->picture_width_in_mbs  = (codec->width  + 15) / 16;
 +    param->picture_height_in_mbs = (codec->height + 15) / 16;
@@ -446,21 +480,115 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
 -    //seq_fields.bits.chroma_format_idc
 -    //seq_fields.bits.frame_mbs_only_flag
 +    /*
-+     * chroma_format_idc, frame_mbs_only_flag, direct_8x8_inference_flag,
-+     * and log2_max_frame_num_minus4 must be set for Intel iHD / xe.
++     * chroma_format_idc, frame_mbs_only_flag, direct_8x8_inference_flag, and
++     * log2_max_frame_num_minus4 are required by Intel iHD/xe.
 +     * These are standard H.264 baseline/main/high profile values.
 +     */
-+    param->seq_fields.bits.chroma_format_idc       = 1; /* YUV 4:2:0 */
-+    param->seq_fields.bits.frame_mbs_only_flag      = 1;
++    param->seq_fields.bits.chroma_format_idc        = 1; /* YUV 4:2:0 */
++    param->seq_fields.bits.frame_mbs_only_flag       = 1;
++    param->seq_fields.bits.direct_8x8_inference_flag = 1;
++    param->seq_fields.bits.log2_max_frame_num_minus4 = 4; /* max_frame_num = 256 */
      //seq_fields.bits.mb_adaptive_frame_field_flag
      //seq_fields.bits.seq_scaling_matrix_present_flag
 -    //seq_fields.bits.direct_8x8_inference_flag
 -    //seq_fields.bits.log2_max_frame_num_minus4
-+    param->seq_fields.bits.direct_8x8_inference_flag = 1;
-+    param->seq_fields.bits.log2_max_frame_num_minus4 = 4; /* max_frame_num = 256 */
      ITEM_SET(&param->seq_fields.bits, &desc->seq, pic_order_cnt_type);
      //seq_fields.bit.log2_max_pic_order_cnt_lsb_minus4
      //seq_fields.bit.delta_pic_order_always_zero_flag
-
--- 
-2.45.0
+@@ -1384,32 +1607,46 @@
+     unsigned i;
+     int err = 0;
+     VAStatus va_stat;
+-    VABufferID *slice_data_buf, pic_param_buf, iq_matrix_buf, slice_param_buf;
++    VABufferID *slice_data_buf, *slice_param_buf, pic_param_buf, iq_matrix_buf;
+     VAPictureParameterBufferH264 pic_param;
+     VAIQMatrixBufferH264 iq_matrix;
+     VASliceParameterBufferH264 slice_param;
+ 
+-    slice_data_buf = calloc(num_buffers, sizeof(VABufferID));
+-    if (!slice_data_buf) {
+-        virgl_error("alloc slice data buffer id failed\n");
++    /*
++     * Allocate per-slice buffer ID arrays.
++     * We pair one VASliceParameterBufferH264 with each VASliceDataBufferType
++     * so that Intel iHD/xe can find the correct slice_data_size and RefPicList
++     * for each NAL unit.  Mesa is lenient and also accepts this arrangement.
++     */
++    slice_data_buf  = calloc(num_buffers, sizeof(VABufferID));
++    slice_param_buf = calloc(num_buffers, sizeof(VABufferID));
++    if (!slice_data_buf || !slice_param_buf) {
++        virgl_error("alloc slice buffer ids failed\n");
++        free(slice_data_buf);
++        free(slice_param_buf);
+         return -1;
+     }
+ 
++    /* Picture-level parameters (one per frame) */
++    memset(&pic_param, 0, sizeof(pic_param));
+     h264_fill_picture_param(codec, target, desc, &pic_param);
+     vaCreateBuffer(va_dpy, codec->va_ctx, VAPictureParameterBufferType,
+                    sizeof(pic_param), 1, &pic_param, &pic_param_buf);
+ 
++    memset(&iq_matrix, 0, sizeof(iq_matrix));
+     h264_fill_iq_matrix(desc, &iq_matrix);
+     vaCreateBuffer(va_dpy, codec->va_ctx, VAIQMatrixBufferType,
+                    sizeof(iq_matrix), 1, &iq_matrix, &iq_matrix_buf);
+ 
+-    h264_fill_slice_param(desc, &slice_param);
+-    vaCreateBuffer(va_dpy, codec->va_ctx, VASliceParameterBufferType,
+-                   sizeof(slice_param), 1, &slice_param, &slice_param_buf);
+-
++    /* Per-slice parameters + data (one pair per NALU buffer) */
+     for (i = 0; i < num_buffers; i++) {
++        memset(&slice_param, 0, sizeof(slice_param));
++        h264_fill_slice_param(desc, buffers[i], sizes[i], &slice_param);
++        vaCreateBuffer(va_dpy, codec->va_ctx, VASliceParameterBufferType,
++                       sizeof(slice_param), 1, &slice_param, &slice_param_buf[i]);
++
+         vaCreateBuffer(va_dpy, codec->va_ctx, VASliceDataBufferType,
+-                      sizes[i], 1, (void *)(buffers[i]), &slice_data_buf[i]);
++                       sizes[i], 1, (void *)(buffers[i]), &slice_data_buf[i]);
+     }
+ 
+     va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &pic_param_buf, 1);
+@@ -1426,18 +1663,17 @@
+         goto err;
+     }
+ 
+-    va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_param_buf, 1);
+-    if (VA_STATUS_SUCCESS != va_stat) {
+-        virgl_error("render slice param failed, err = 0x%x\n", va_stat);
+-        err = -1;
+-        goto err;
+-    }
+-
+     for (i = 0; i < num_buffers; i++) {
+-        va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_data_buf[i], 1);
++        va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_param_buf[i], 1);
++        if (VA_STATUS_SUCCESS != va_stat) {
++            virgl_error("render slice param[%u] failed, err = 0x%x\n", i, va_stat);
++            err = -1;
++            goto err;
++        }
+ 
++        va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &slice_data_buf[i], 1);
+         if (VA_STATUS_SUCCESS != va_stat) {
+-            virgl_error("render slice data failed, err = 0x%x\n", va_stat);
++            virgl_error("render slice data[%u] failed, err = 0x%x\n", i, va_stat);
+             err = -1;
+         }
+     }
+@@ -1445,9 +1681,11 @@
+ err:
+     vaDestroyBuffer(va_dpy, pic_param_buf);
+     vaDestroyBuffer(va_dpy, iq_matrix_buf);
+-    vaDestroyBuffer(va_dpy, slice_param_buf);
+-    for (i = 0; i < num_buffers; i++)
++    for (i = 0; i < num_buffers; i++) {
++        vaDestroyBuffer(va_dpy, slice_param_buf[i]);
+         vaDestroyBuffer(va_dpy, slice_data_buf[i]);
++    }
++    free(slice_param_buf);
+     free(slice_data_buf);
+ 
+     return err;
