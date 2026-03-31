@@ -1,151 +1,381 @@
-diff --git a/hw/display/edid-generate.c b/hw/display/edid-generate.c
-index 2cb819675..5a6355164 100644
---- a/hw/display/edid-generate.c
-+++ b/hw/display/edid-generate.c
-@@ -5,6 +5,7 @@
-  * See the COPYING file in the top-level directory.
-  */
- #include "qemu/osdep.h"
-+#include <stdlib.h>
- #include "qemu/bswap.h"
- #include "hw/display/edid.h"
+From: virglrenderer patch <virglrenderer@patch>
+Date: Tue, 31 Mar 2026 00:00:00 +0000
+Subject: [PATCH] virgl_video: support non-Mesa VA-API drivers (Intel xe/iHD, NVIDIA, etc.)
+
+Remove the Mesa-only guard in virgl_video_init() and fix five additional
+Intel iHD / xe blockers that were hidden behind it:
+
+  1. picture_width/height_in_mbs_minus1 left as commented-out stubs.
+  2. h264 encode sequence params (intra_period, ip_period, picture size,
+     chroma_format_idc, frame_mbs_only_flag, direct_8x8_inference_flag,
+     log2_max_frame_num_minus4) left as stubs.
+  3. Encoder reference surfaces created with NV21 instead of NV12.
+  4. vaCreateSurfaces() called without VASurfaceAttribUsageHint.
+  5. VAEntrypointEncSliceLP absent from is_supported() and entrypoint map.
+
+No new build options are introduced; non-Mesa drivers are enabled
+whenever virglrenderer is built with -Dvideo=true.
+
+Signed-off-by: virglrenderer patch <virglrenderer@patch>
+---
+ src/vrend/virgl_video.h  |  47 ++++++++++++
+ src/vrend/virgl_video.c  | 228 +++++++++++++++++++++++++++++++++++++++++++----
+ 2 files changed, 256 insertions(+), 19 deletions(-)
+
+--- a/src/vrend/virgl_video.h
++++ b/src/vrend/virgl_video.h
+@@ -72,10 +72,44 @@
+     uint32_t width;
+     uint32_t height;
+     bool interlaced;
++    /*
++     * VA surface usage hint.  Required on Intel iHD / xe driver.
++     * Other drivers ignore it.  Pass 0 for "no hint".
++     */
++    uint32_t usage_hint;
+     void *opaque;
+ };
  
-@@ -386,8 +387,16 @@ void qemu_edid_generate(uint8_t *edid, size_t size,
-     uint8_t *xtra3 = NULL;
-     uint8_t *dta = NULL;
-     uint8_t *did = NULL;
--    uint32_t width_mm, height_mm;
--    uint32_t refresh_rate = info->refresh_rate ? info->refresh_rate : 75000;
-+    uint32_t width_mm, height_mm; 
-+    uint32_t refresh_rate = 60000;  
-+    char *env_refresh = getenv("QEMU_REFRESH_RATE");  
-+    if (env_refresh && *env_refresh) {  
-+        refresh_rate = (uint32_t)strtoul(env_refresh, NULL, 10);  
-+        if (refresh_rate == 0) refresh_rate = 60000; // <--- The Safety Net
-+        fprintf(stderr, "VIRTIO-GPU: EDID Rate set to %u mHz\n", refresh_rate);  
-+    } else if (info->refresh_rate) {  
-+        refresh_rate = info->refresh_rate;  
-+    }
-     uint32_t dpi = 100; /* if no width_mm/height_mm */
-     uint32_t large_screen = 0;
++/*
++ * Aliases for VASurfaceAttribUsageHint so callers do not need <va/va.h>.
++ */
++#ifndef VA_SURFACE_ATTRIB_USAGE_HINT_DECODER
++# define VIRGL_VA_USAGE_HINT_DECODER   0x00000001u
++# define VIRGL_VA_USAGE_HINT_ENCODER   0x00000002u
++# define VIRGL_VA_USAGE_HINT_VPP_READ  0x00000004u
++# define VIRGL_VA_USAGE_HINT_GENERIC   0x00000100u
++#else
++# define VIRGL_VA_USAGE_HINT_DECODER   VA_SURFACE_ATTRIB_USAGE_HINT_DECODER
++# define VIRGL_VA_USAGE_HINT_ENCODER   VA_SURFACE_ATTRIB_USAGE_HINT_ENCODER
++# define VIRGL_VA_USAGE_HINT_VPP_READ  VA_SURFACE_ATTRIB_USAGE_HINT_VPP_READ
++# define VIRGL_VA_USAGE_HINT_GENERIC   VA_SURFACE_ATTRIB_USAGE_HINT_GENERIC
++#endif
++
+ /* flags for virgl_video_dma_buffers */
+ #define VIRGL_VIDEO_DMABUF_READ_ONLY        0x0001
+ #define VIRGL_VIDEO_DMABUF_WRITE_ONLY       0x0002
+ #define VIRGL_VIDEO_DMABUF_READ_WRITE       0x0003
  
-diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index 07f6355ad..9a752cb7f 100644
---- a/hw/display/virtio-gpu-virgl.c
-+++ b/hw/display/virtio-gpu-virgl.c
-@@ -22,6 +22,13 @@
++/*
++ * Runtime flag for virgl_video_init(): restrict to Mesa drivers only even
++ * when the library was built with full driver support.
++ */
++#define VIRGL_VIDEO_INIT_FLAG_MESA_ONLY  (1u << 8)
++
+ struct virgl_video_dma_buf {
+     struct virgl_video_buffer *buf;
+
+--- a/src/vrend/virgl_video.c
++++ b/src/vrend/virgl_video.c
+@@ -88,6 +88,26 @@
+ #define CODED_BUF_DEFAULT_SIZE(width, height) \
+     ((width) * (height) / (16 * 16) * 512)
  
- #include "ui/egl-helpers.h"
++enum virgl_va_driver_family {
++    VIRGL_VA_DRIVER_MESA    = 0,
++    VIRGL_VA_DRIVER_INTEL,
++    VIRGL_VA_DRIVER_NVIDIA,
++    VIRGL_VA_DRIVER_UNKNOWN,
++};
++
++static enum virgl_va_driver_family va_driver_family = VIRGL_VA_DRIVER_UNKNOWN;
++
++/*
++ * Encode entrypoint capabilities probed at init time.
++ *   VA_ENC_CAP_ENCSLICE    – VAEntrypointEncSlice   is available
++ *   VA_ENC_CAP_ENCSLICE_LP – VAEntrypointEncSliceLP is available
++ */
++#define VA_ENC_CAP_ENCSLICE    (1u << 0)
++#define VA_ENC_CAP_ENCSLICE_LP (1u << 1)
++
++static unsigned va_encode_caps = 0;
++
+ struct virgl_video_buffer {
+     enum pipe_format format;
+     uint32_t width;
+@@ -109,6 +129,7 @@
+    uint32_t max_references;
+    VAContextID va_ctx;
+    VAConfigID  va_cfg;
++   int         va_entrypoint;
+    struct virgl_video_buffer *buffer;
+    struct virgl_video_buffer *ref_pic_list[32];
+    VABufferID  va_coded_buf;
+@@ -166,7 +187,9 @@
+    }
+ }
  
-+extern int qemu_drm_rendernode_open(const char *rendernode);
-+static int virgl_get_drm_fd(void *opaque)
+-/* NOTE: mesa va frontend only supports VLD and EncSlice */
++/*
++ * VAEntrypointEncSlice and VAEntrypointEncSliceLP both map to PIPE_VIDEO_ENTRYPOINT_ENCODE.
++ */
+ static enum pipe_video_entrypoint pipe_entrypoint_from_va(
+         VAEntrypoint entrypoint)
+ {
+@@ -282,7 +305,20 @@
+     case PIPE_VIDEO_ENTRYPOINT_MC:
+         return VAEntrypointMoComp;
+     case PIPE_VIDEO_ENTRYPOINT_ENCODE:
++        if (va_driver_family == VIRGL_VA_DRIVER_INTEL &&
++            (va_encode_caps & VA_ENC_CAP_ENCSLICE_LP))
++            return VAEntrypointEncSliceLP;
+         return VAEntrypointEncSlice;
+     default:
+         return VAEntrypointNone;
+     }
+ }
+ 
++static int va_encode_entrypoint_fallback(int primary)
 +{
-+    /* Respect VAAPI_DEVICE env var, fallback to NULL (auto) if not set */
-+    return qemu_drm_rendernode_open(getenv("VAAPI_DEVICE"));
++    if (primary == VAEntrypointEncSlice &&
++        (va_encode_caps & VA_ENC_CAP_ENCSLICE_LP))
++        return VAEntrypointEncSliceLP;
++
++    if (primary == VAEntrypointEncSliceLP &&
++        (va_encode_caps & VA_ENC_CAP_ENCSLICE))
++        return VAEntrypointEncSlice;
++
++    return VAEntrypointNone;
 +}
 +
- #include <virglrenderer.h>
+ static uint32_t va_format_from_pipe(uint32_t format)
+ {
+@@ -526,7 +562,9 @@
+     idx = frame_num % ARRAY_SIZE(codec->ref_pic_list);
  
- struct virtio_gpu_virgl_resource {
-@@ -1084,6 +1091,7 @@ static struct virgl_renderer_callbacks virtio_gpu_3d_cbs = {
- #if VIRGL_VERSION_MAJOR >= 1
-     .write_context_fence = virgl_write_context_fence,
- #endif
-+    .get_drm_fd          = virgl_get_drm_fd,
- };
+     if (!codec->ref_pic_list[idx]) {
+-        args.format = PIPE_FORMAT_NV21;
++        /* NV21 is not supported by Intel iHD / xe. NV12 is the safe baseline. */
++        args.format = PIPE_FORMAT_NV12;
+         args.width = codec->width;
+         args.height = codec->height;
+         args.interlaced = 0;
+@@ -541,6 +579,60 @@
+     return codec->ref_pic_list[idx]->va_sfc;
+ }
  
- static void virtio_gpu_print_stats(void *opaque)
-@@ -1144,6 +1152,7 @@ int virtio_gpu_virgl_init(VirtIOGPU *g)
-     int ret;
-     uint32_t flags = 0;
-     VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
-+    flags |= VIRGL_RENDERER_USE_VIDEO;
++static enum virgl_va_driver_family virgl_video_detect_driver(const char *vendor)
++{
++    if (!vendor)
++        return VIRGL_VA_DRIVER_UNKNOWN;
++    if (strstr(vendor, "Mesa Gallium"))
++        return VIRGL_VA_DRIVER_MESA;
++    if (strstr(vendor, "Intel iHD Driver") ||
++        strstr(vendor, "Intel i965 driver") ||
++        strstr(vendor, "Intel(R)"))
++        return VIRGL_VA_DRIVER_INTEL;
++    if (strstr(vendor, "VDPAU") || strstr(vendor, "NVIDIA"))
++        return VIRGL_VA_DRIVER_NVIDIA;
++    return VIRGL_VA_DRIVER_UNKNOWN;
++}
++
++static void virgl_video_probe_encode_caps(void)
++{
++    VAEntrypoint *eps;
++    int n, max_eps;
++
++    va_encode_caps = 0;
++    max_eps = vaMaxNumEntrypoints(va_dpy);
++    if (max_eps <= 0)
++        return;
++
++    eps = calloc(max_eps, sizeof(*eps));
++    if (!eps)
++        return;
++
++    if (vaQueryConfigEntrypoints(va_dpy, VAProfileH264High,
++                                 eps, &n) == VA_STATUS_SUCCESS) {
++        for (int i = 0; i < n; i++) {
++            if (eps[i] == VAEntrypointEncSlice)
++                va_encode_caps |= VA_ENC_CAP_ENCSLICE;
++            if (eps[i] == VAEntrypointEncSliceLP)
++                va_encode_caps |= VA_ENC_CAP_ENCSLICE_LP;
++        }
++    }
++
++    free(eps);
++    virgl_info("VA encode caps: EncSlice=%d EncSliceLP=%d\n",
++               !!(va_encode_caps & VA_ENC_CAP_ENCSLICE),
++               !!(va_encode_caps & VA_ENC_CAP_ENCSLICE_LP));
++}
++
+ int virgl_video_init(int drm_fd,
+                      struct virgl_video_callbacks *cbs, unsigned int flags)
+ {
+@@ -548,8 +640,6 @@
+     int major_ver, minor_ver;
+     const char *driver;
  
- #if VIRGL_RENDERER_CALLBACKS_VERSION >= 4
-     if (qemu_egl_display) {
-diff --git a/hw/usb/dev-hid.c b/hw/usb/dev-hid.c
-index 96623aa32..2f60a9dc5 100644
---- a/hw/usb/dev-hid.c
-+++ b/hw/usb/dev-hid.c
-@@ -102,7 +102,7 @@ static const USBDescIface desc_iface_mouse = {
-             .bEndpointAddress      = USB_DIR_IN | 0x01,
-             .bmAttributes          = USB_ENDPOINT_XFER_INT,
-             .wMaxPacketSize        = 4,
--            .bInterval             = 0x0a,
-+            .bInterval                = 0x01,
-         },
-     },
- };
-@@ -133,7 +133,7 @@ static const USBDescIface desc_iface_mouse2 = {
-             .bEndpointAddress      = USB_DIR_IN | 0x01,
-             .bmAttributes          = USB_ENDPOINT_XFER_INT,
-             .wMaxPacketSize        = 4,
--            .bInterval             = 7, /* 2 ^ (8-1) * 125 usecs = 8 ms */
-+            .bInterval                = 4, /* 2 ^ (4-1) * 125 usecs = 1 ms */
-         },
-     },
- };
-@@ -163,7 +163,7 @@ static const USBDescIface desc_iface_tablet = {
-             .bEndpointAddress      = USB_DIR_IN | 0x01,
-             .bmAttributes          = USB_ENDPOINT_XFER_INT,
-             .wMaxPacketSize        = 8,
--            .bInterval             = 0x0a,
-+            .bInterval                = 0x01,
-         },
-     },
- };
-@@ -193,7 +193,7 @@ static const USBDescIface desc_iface_tablet2 = {
-             .bEndpointAddress      = USB_DIR_IN | 0x01,
-             .bmAttributes          = USB_ENDPOINT_XFER_INT,
-             .wMaxPacketSize        = 8,
--            .bInterval             = 4, /* 2 ^ (4-1) * 125 usecs = 1 ms */
-+            .bInterval                = 4, /* 2 ^ (4-1) * 125 usecs = 1 ms */
-         },
-     },
- };
-@@ -224,7 +224,7 @@ static const USBDescIface desc_iface_keyboard = {
-             .bEndpointAddress      = USB_DIR_IN | 0x01,
-             .bmAttributes          = USB_ENDPOINT_XFER_INT,
-             .wMaxPacketSize        = 8,
--            .bInterval             = 0x0a,
-+            .bInterval                = 0x01,
-         },
-     },
- };
-@@ -255,7 +255,7 @@ static const USBDescIface desc_iface_keyboard2 = {
-             .bEndpointAddress      = USB_DIR_IN | 0x01,
-             .bmAttributes          = USB_ENDPOINT_XFER_INT,
-             .wMaxPacketSize        = 8,
--            .bInterval             = 7, /* 2 ^ (8-1) * 125 usecs = 8 ms */
-+            .bInterval                = 4, /* 2 ^ (4-1) * 125 usecs = 1 ms */
-         },
-     },
- };
-diff --git a/include/ui/console.h b/include/ui/console.h
-index 98feaa58b..b419983c0 100644
---- a/include/ui/console.h
-+++ b/include/ui/console.h
-@@ -44,7 +44,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(QemuFixedTextConsole, QEMU_FIXED_TEXT_CONSOLE)
- #define QEMU_CAPS_LOCK_LED   (1 << 2)
+-    (void)flags;
+-
+     if (drm_fd < 0) {
+         virgl_error("invalid drm fd: %d\n", drm_fd);
+         return -1;
+@@ -573,11 +663,27 @@
+     driver = vaQueryVendorString(va_dpy);
+     virgl_info("Driver version: %s\n", driver ? driver : "<unknown>");
  
- /* in ms */
--#define GUI_REFRESH_INTERVAL_DEFAULT    30
-+#define GUI_REFRESH_INTERVAL_DEFAULT    1
- #define GUI_REFRESH_INTERVAL_IDLE     3000
+-    if (!driver || !strstr(driver, "Mesa Gallium")) {
+-        virgl_error("only supports mesa va drivers now\n");
++    va_driver_family = virgl_video_detect_driver(driver);
++
++    /* Honour an explicit Mesa-only runtime restriction. */
++    if ((flags & VIRGL_VIDEO_INIT_FLAG_MESA_ONLY) &&
++        va_driver_family != VIRGL_VA_DRIVER_MESA) {
++        virgl_error("only supports mesa va drivers (runtime flag)\n");
+         virgl_video_destroy();
+         return -1;
+     }
  
- /* Color number is match to standard vga palette */
-diff --git a/meson.build b/meson.build
-index d9293294d..e0c11c38d 100644
---- a/meson.build
-+++ b/meson.build
-@@ -1416,6 +1416,10 @@ if not get_option('virglrenderer').auto() or have_system or have_vhost_user_gpu
-   virgl = dependency('virglrenderer',
-                      method: 'pkg-config',
-                      required: get_option('virglrenderer'))
-+ 
-+if virgl.found()
-+  virgl = declare_dependency(compile_args: '-DVIRGL_RENDERER_UNSTABLE_APIS', dependencies: virgl)
-+endif
- endif
- rutabaga = not_found
- if not get_option('rutabaga_gfx').auto() or have_system or have_vhost_user_gpu
+-    callbacks = cbs;
++    switch (va_driver_family) {
++    case VIRGL_VA_DRIVER_MESA:
++        virgl_info("VA driver family: Mesa Gallium\n"); break;
++    case VIRGL_VA_DRIVER_INTEL:
++        virgl_info("VA driver family: Intel (iHD / Xe)\n"); break;
++    case VIRGL_VA_DRIVER_NVIDIA:
++        virgl_info("VA driver family: NVIDIA (VDPAU bridge)\n"); break;
++    default:
++        virgl_info("VA driver family: unknown\n"); break;
++    }
+ 
++    virgl_video_probe_encode_caps();
++    callbacks = cbs;
+     return 0;
+ }
+ 
+@@ -599,11 +705,16 @@
+         {VAProfileMPEG2Simple,  {VAEntrypointVLD, 0}},
+         {VAProfileMPEG2Main,    {VAEntrypointVLD, 0}},
+         {VAProfileH264ConstrainedBaseline,
+-                                {VAEntrypointVLD, VAEntrypointEncSlice, 0}},
+-        {VAProfileH264Main,     {VAEntrypointVLD, VAEntrypointEncSlice, 0}},
+-        {VAProfileH264High,     {VAEntrypointVLD, VAEntrypointEncSlice, 0}},
+-        {VAProfileHEVCMain,     {VAEntrypointVLD, VAEntrypointEncSlice, 0}},
+-        {VAProfileHEVCMain10,   {VAEntrypointVLD, VAEntrypointEncSlice, 0}},
++                                {VAEntrypointVLD, VAEntrypointEncSlice,
++                                 VAEntrypointEncSliceLP, 0}},
++        {VAProfileH264Main,     {VAEntrypointVLD, VAEntrypointEncSlice,
++                                 VAEntrypointEncSliceLP, 0}},
++        {VAProfileH264High,     {VAEntrypointVLD, VAEntrypointEncSlice,
++                                 VAEntrypointEncSliceLP, 0}},
++        {VAProfileHEVCMain,     {VAEntrypointVLD, VAEntrypointEncSlice,
++                                 VAEntrypointEncSliceLP, 0}},
++        {VAProfileHEVCMain10,   {VAEntrypointVLD, VAEntrypointEncSlice,
++                                 VAEntrypointEncSliceLP, 0}},
+         {VAProfileJPEGBaseline, {VAEntrypointVLD, 0}},
+         {VAProfileVC1Simple,    {VAEntrypointVLD, 0}},
+         {VAProfileVC1Main,      {VAEntrypointVLD, 0}},
+@@ -762,9 +873,34 @@
+     attr.type = VAConfigAttribRTFormat;
+     vaGetConfigAttributes(va_dpy, profile, entrypoint, &attr, 1);
+     if (!(attr.value & format)) {
+-        virgl_error("format 0x%x not supported, supported formats: 0x%x\n",
+-                  format, attr.value);
+-        goto err;
++        int alt = VAEntrypointNone;
++        if (args->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE)
++            alt = va_encode_entrypoint_fallback(entrypoint);
++
++        if (alt != VAEntrypointNone) {
++            VAConfigAttrib alt_attr = { .type = VAConfigAttribRTFormat };
++            vaGetConfigAttributes(va_dpy, profile, alt, &alt_attr, 1);
++            if (alt_attr.value & format) {
++                virgl_info("encode: switching entrypoint %d -> %d for profile %d\n",
++                           entrypoint, alt, profile);
++                entrypoint = alt;
++                attr = alt_attr;
++            } else {
++                virgl_error("format 0x%x not supported by either encode entrypoint\n",
++                            format);
++                goto err;
++            }
++        } else {
++            virgl_error("format 0x%x not supported, supported formats: 0x%x\n",
++                      format, attr.value);
++            goto err;
++        }
+     }
+ 
+     va_stat = vaCreateConfig(va_dpy, profile, entrypoint, &attr, 1, &cfg);
+@@ -790,8 +926,10 @@
+     codec->height = args->height;
+     codec->max_references = args->max_references;
+     codec->opaque = args->opaque;
++    codec->va_entrypoint = entrypoint;
+ 
+-    if (entrypoint == VAEntrypointEncSlice) {
++    if (entrypoint == VAEntrypointEncSlice ||
++        entrypoint == VAEntrypointEncSliceLP) {
+         vaCreateBuffer(va_dpy, codec->va_ctx, VAEncCodedBufferType,
+                        CODED_BUF_DEFAULT_SIZE(codec->width, codec->height),
+                        1, NULL, &codec->va_coded_buf);
+@@ -836,6 +974,8 @@
+     VASurfaceID sfc;
+     uint32_t format;
+     struct virgl_video_buffer *buffer;
++    VASurfaceAttrib attribs[2];
++    unsigned num_attribs = 0;
+ 
+     if (!va_dpy || !args)
+         return NULL;
+@@ -850,8 +990,21 @@
+     if (!buffer)
+         return NULL;
+ 
++    if (args->usage_hint != 0) {
++        attribs[num_attribs].type               = VASurfaceAttribUsageHint;
++        attribs[num_attribs].flags              = VA_SURFACE_ATTRIB_SETTABLE;
++        attribs[num_attribs].value.type         = VAGenericValueTypeInteger;
++        attribs[num_attribs].value.value.i      = (int)args->usage_hint;
++        num_attribs++;
++    }
++
+     va_stat = vaCreateSurfaces(va_dpy, format,
+-                               args->width, args->height, &sfc, 1, NULL, 0);
++                               args->width, args->height, &sfc, 1,
++                               num_attribs ? attribs : NULL, num_attribs);
+     if (VA_STATUS_SUCCESS != va_stat) {
+         free(buffer);
+         return NULL;
+@@ -989,8 +1142,10 @@
+         pic->BottomFieldOrderCnt = desc->field_order_cnt_list[i][1];
+     }
+ 
+-    //vapp->picture_width_in_mbs_minus1  = (codec->width - 1) / 16;
+-    //vapp->picture_height_in_mbs_minus1 = (codec->height - 1) / 16;
++    vapp->picture_width_in_mbs_minus1  = (codec->width  + 15) / 16 - 1;
++    vapp->picture_height_in_mbs_minus1 = (codec->height + 15) / 16 - 1;
+     ITEM_SET(vapp, &desc->pps.sps, bit_depth_luma_minus8);
+     ITEM_SET(vapp, &desc->pps.sps, bit_depth_chroma_minus8);
+     ITEM_SET(vapp, desc, num_ref_frames);
+@@ -1251,17 +1406,28 @@
+ 
+     //seq_parameter_set_id;
+     param->level_idc = codec->level;
+-    //intra_period;
++    param->intra_period     = desc->intra_idr_period;
+     param->intra_idr_period = desc->intra_idr_period;
+-    //ip_period;
+-    //bits_per_second;
++    param->ip_period        = 1;
+     param->max_num_ref_frames = codec->max_references;
+-    //picture_width_in_mbs;
+-    //picture_height_in_mbs;
++    param->picture_width_in_mbs  = (codec->width  + 15) / 16;
++    param->picture_height_in_mbs = (codec->height + 15) / 16;
+ 
+     /* seq_fields.bits */
+-    //seq_fields.bits.chroma_format_idc
+-    //seq_fields.bits.frame_mbs_only_flag
++    param->seq_fields.bits.chroma_format_idc       = 1;
++    param->seq_fields.bits.frame_mbs_only_flag     = 1;
+     //seq_fields.bits.mb_adaptive_frame_field_flag
+     //seq_fields.bits.seq_scaling_matrix_present_flag
+-    //seq_fields.bits.direct_8x8_inference_flag
+-    //seq_fields.bits.log2_max_frame_num_minus4
++    param->seq_fields.bits.direct_8x8_inference_flag = 1;
++    param->seq_fields.bits.log2_max_frame_num_minus4 = 4;
+     ITEM_SET(&param->seq_fields.bits, &desc->seq, pic_order_cnt_type);
+     //seq_fields.bit.log2_max_pic_order_cnt_lsb_minus4
+     //seq_fields.bit.delta_pic_order_always_zero_flag
