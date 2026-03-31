@@ -51,7 +51,7 @@
           # GBM allocation must be enabled for the patch to activate --
           # the key code paths are gated on ENABLE_GBM_ALLOCATION
           mesonFlags = (oldAttrs.mesonFlags or [ ]) ++ [
-            "-Dminigbm_allocation=true"
+            "-Ddrm-renderers=xe-experimental"
           ];
         });
 
