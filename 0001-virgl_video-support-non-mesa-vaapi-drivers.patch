@@ -48,8 +48,14 @@
          uint32_t pitch;
      } planes[4];
 --- virglrenderer-main/src/vrend/virgl_video.c	2026-03-26 15:55:06.000000000 +0000
-+++ virglrenderer-patched/src/vrend/virgl_video.c	2026-03-31 14:16:11.727510696 +0000
-@@ -67,6 +67,8 @@
++++ virglrenderer-patched/src/vrend/virgl_video.c	2026-03-31 14:26:30.531261428 +0000
+@@ -62,11 +62,14 @@
+ #include <stdbool.h>
+ #include <stdlib.h>
+ #include <string.h>
++#include <errno.h>
+ #include <unistd.h>
+ #include <epoxy/gl.h>
  #include <epoxy/egl.h>
  #include <va/va.h>
  #include <va/va_drm.h>
@@ -58,7 +64,7 @@
  #include <va/va_drmcommon.h>
  #include <drm_fourcc.h>
  
-@@ -88,6 +90,28 @@
+@@ -88,6 +91,28 @@
  #define CODED_BUF_DEFAULT_SIZE(width, height) \
      ((width) * (height) / (16 * 16) * 512)
  
@@ -87,7 +93,7 @@
  struct virgl_video_buffer {
      enum pipe_format format;
      uint32_t width;
-@@ -109,6 +133,7 @@
+@@ -109,6 +134,7 @@
     uint32_t max_references;
     VAContextID va_ctx;
     VAConfigID  va_cfg;
@@ -95,7 +101,7 @@
     struct virgl_video_buffer *buffer;
     struct virgl_video_buffer *ref_pic_list[32]; /* Enc: reference pictures */
     VABufferID  va_coded_buf;                    /* Enc: VACodedBuffer */
-@@ -122,6 +147,13 @@
+@@ -122,6 +148,13 @@
  
  static VADisplay va_dpy;
  
@@ -109,7 +115,7 @@
  static struct virgl_video_callbacks *callbacks = NULL;
  
  static enum pipe_video_profile pipe_profile_from_va(VAProfile profile)
-@@ -166,7 +198,7 @@
+@@ -166,7 +199,7 @@
     }
  }
  
@@ -118,7 +124,7 @@
  static enum pipe_video_entrypoint pipe_entrypoint_from_va(
          VAEntrypoint entrypoint)
  {
-@@ -282,12 +314,32 @@
+@@ -282,12 +315,32 @@
      case PIPE_VIDEO_ENTRYPOINT_MC:
          return VAEntrypointMoComp;
      case PIPE_VIDEO_ENTRYPOINT_ENCODE:
@@ -151,7 +157,7 @@
  static uint32_t va_format_from_pipe(uint32_t format)
  {
      uint32_t va_format;
-@@ -526,7 +578,7 @@
+@@ -526,7 +579,7 @@
      idx = frame_num % ARRAY_SIZE(codec->ref_pic_list);
  
      if (!codec->ref_pic_list[idx]) {
@@ -160,7 +166,7 @@
          args.width = codec->width;
          args.height = codec->height;
          args.interlaced = 0;
-@@ -541,31 +593,282 @@
+@@ -541,31 +594,282 @@
      return codec->ref_pic_list[idx]->va_sfc;
  }
  
@@ -248,7 +254,7 @@
 +            virgl_info("using VIRGL_VIDEO_DRM_DEVICE=%s\n", override);
 +            return fd;
 +        }
-+        virgl_error("cannot open VIRGL_VIDEO_DRM_DEVICE=%s: %m\n", override);
++        virgl_error("cannot open VIRGL_VIDEO_DRM_DEVICE=%s: %s\n", override, strerror(errno));
 +        return -1;
 +    }
 +
@@ -448,7 +454,7 @@
      }
  
      virgl_info("VA-API version: %d.%d\n", major_ver, minor_ver);
-@@ -573,12 +876,24 @@
+@@ -573,12 +877,24 @@
      driver = vaQueryVendorString(va_dpy);
      virgl_info("Driver version: %s\n", driver ? driver : "<unknown>");
  
@@ -477,7 +483,7 @@
      callbacks = cbs;
  
      return 0;
-@@ -591,6 +906,11 @@
+@@ -591,6 +907,11 @@
          va_dpy = NULL;
      }
  
@@ -489,7 +495,7 @@
      callbacks = NULL;
  }
  
-@@ -602,11 +922,16 @@
+@@ -602,11 +923,16 @@
          {VAProfileMPEG2Simple,  {VAEntrypointVLD, 0}},
          {VAProfileMPEG2Main,    {VAEntrypointVLD, 0}},
          {VAProfileH264ConstrainedBaseline,
@@ -511,7 +517,7 @@
          {VAProfileJPEGBaseline, {VAEntrypointVLD, 0}},
          {VAProfileVC1Simple,    {VAEntrypointVLD, 0}},
          {VAProfileVC1Main,      {VAEntrypointVLD, 0}},
-@@ -762,9 +1087,32 @@
+@@ -762,9 +1088,32 @@
      attr.type = VAConfigAttribRTFormat;
      vaGetConfigAttributes(va_dpy, profile, entrypoint, &attr, 1);
      if (!(attr.value & format)) {
@@ -547,7 +553,7 @@
      }
  
      va_stat = vaCreateConfig(va_dpy, profile, entrypoint, &attr, 1, &cfg);
-@@ -790,8 +1138,10 @@
+@@ -790,8 +1139,10 @@
      codec->height = args->height;
      codec->max_references = args->max_references;
      codec->opaque = args->opaque;
@@ -559,7 +565,7 @@
          vaCreateBuffer(va_dpy, codec->va_ctx, VAEncCodedBufferType,
                         CODED_BUF_DEFAULT_SIZE(codec->width, codec->height),
                         1, NULL, &codec->va_coded_buf);
-@@ -850,8 +1200,25 @@
+@@ -850,8 +1201,25 @@
      if (!buffer)
          return NULL;
  
@@ -587,7 +593,7 @@
      if (VA_STATUS_SUCCESS != va_stat) {
          free(buffer);
          return NULL;
-@@ -989,8 +1356,12 @@
+@@ -989,8 +1357,12 @@
          pic->BottomFieldOrderCnt = desc->field_order_cnt_list[i][1];
      }
  
@@ -602,7 +608,7 @@
      ITEM_SET(vapp, &desc->pps.sps, bit_depth_luma_minus8);
      ITEM_SET(vapp, &desc->pps.sps, bit_depth_chroma_minus8);
      ITEM_SET(vapp, desc, num_ref_frames);
-@@ -1045,44 +1416,89 @@
+@@ -1045,44 +1417,89 @@
  }
  
  /*
@@ -724,7 +730,7 @@
  }
  
  /*
-@@ -1251,21 +1667,34 @@
+@@ -1251,21 +1668,34 @@
  
      //seq_parameter_set_id;
      param->level_idc = codec->level;
@@ -768,7 +774,7 @@
      ITEM_SET(&param->seq_fields.bits, &desc->seq, pic_order_cnt_type);
      //seq_fields.bit.log2_max_pic_order_cnt_lsb_minus4
      //seq_fields.bit.delta_pic_order_always_zero_flag
-@@ -1384,32 +1813,46 @@
+@@ -1384,32 +1814,46 @@
      unsigned i;
      int err = 0;
      VAStatus va_stat;
@@ -824,7 +830,7 @@
      }
  
      va_stat = vaRenderPicture(va_dpy, codec->va_ctx, &pic_param_buf, 1);
-@@ -1426,18 +1869,17 @@
+@@ -1426,18 +1870,17 @@
          goto err;
      }
  
@@ -851,7 +857,7 @@
              err = -1;
          }
      }
-@@ -1445,9 +1887,11 @@
+@@ -1445,9 +1888,11 @@
  err:
      vaDestroyBuffer(va_dpy, pic_param_buf);
      vaDestroyBuffer(va_dpy, iq_matrix_buf);
