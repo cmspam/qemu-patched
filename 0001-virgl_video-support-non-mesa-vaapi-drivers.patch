@@ -1,3 +1,4 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: virglrenderer patch <virglrenderer@patch>
 Date: Tue, 31 Mar 2026 00:00:00 +0000
 Subject: [PATCH] virgl_video: support non-Mesa VA-API drivers (Intel xe/iHD, NVIDIA, etc.)
@@ -18,13 +19,15 @@ whenever virglrenderer is built with -Dvideo=true.
 
 Signed-off-by: virglrenderer patch <virglrenderer@patch>
 ---
- src/vrend/virgl_video.h  |  47 ++++++++++++
- src/vrend/virgl_video.c  | 228 +++++++++++++++++++++++++++++++++++++++++++----
- 2 files changed, 256 insertions(+), 19 deletions(-)
+ src/vrend/virgl_video.h |  47 ++++++++++
+ src/vrend/virgl_video.c | 228 +++++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 250 insertions(+), 25 deletions(-)
 
+diff --git a/src/vrend/virgl_video.h b/src/vrend/virgl_video.h
+index 1111111..2222222 100644
 --- a/src/vrend/virgl_video.h
 +++ b/src/vrend/virgl_video.h
-@@ -72,10 +72,44 @@
+@@ -72,10 +72,57 @@
      uint32_t width;
      uint32_t height;
      bool interlaced;
@@ -57,14 +60,14 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
  #define VIRGL_VIDEO_DMABUF_READ_WRITE       0x0003
  
 +/*
-+ * Runtime flag for virgl_video_init(): restrict to Mesa drivers only even
-+ * when the library was built with full driver support.
++ * Runtime flag for virgl_video_init(): restrict to Mesa drivers only.
 + */
 +#define VIRGL_VIDEO_INIT_FLAG_MESA_ONLY  (1u << 8)
 +
  struct virgl_video_dma_buf {
      struct virgl_video_buffer *buf;
-
+diff --git a/src/vrend/virgl_video.c b/src/vrend/virgl_video.c
+index 3333333..4444444 100644
 --- a/src/vrend/virgl_video.c
 +++ b/src/vrend/virgl_video.c
 @@ -88,6 +88,26 @@
@@ -82,8 +85,6 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
 +
 +/*
 + * Encode entrypoint capabilities probed at init time.
-+ *   VA_ENC_CAP_ENCSLICE    – VAEntrypointEncSlice   is available
-+ *   VA_ENC_CAP_ENCSLICE_LP – VAEntrypointEncSliceLP is available
 + */
 +#define VA_ENC_CAP_ENCSLICE    (1u << 0)
 +#define VA_ENC_CAP_ENCSLICE_LP (1u << 1)
@@ -219,7 +220,6 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
 -        virgl_error("only supports mesa va drivers now\n");
 +    va_driver_family = virgl_video_detect_driver(driver);
 +
-+    /* Honour an explicit Mesa-only runtime restriction. */
 +    if ((flags & VIRGL_VIDEO_INIT_FLAG_MESA_ONLY) &&
 +        va_driver_family != VIRGL_VA_DRIVER_MESA) {
 +        virgl_error("only supports mesa va drivers (runtime flag)\n");
@@ -238,7 +238,7 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
 +    default:
 +        virgl_info("VA driver family: unknown\n"); break;
 +    }
- 
++
 +    virgl_video_probe_encode_caps();
 +    callbacks = cbs;
      return 0;
@@ -379,3 +379,5 @@ Signed-off-by: virglrenderer patch <virglrenderer@patch>
      ITEM_SET(&param->seq_fields.bits, &desc->seq, pic_order_cnt_type);
      //seq_fields.bit.log2_max_pic_order_cnt_lsb_minus4
      //seq_fields.bit.delta_pic_order_always_zero_flag
+-- 
+2.45.0
