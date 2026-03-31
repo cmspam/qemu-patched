@@ -42,10 +42,6 @@
           patches = (oldAttrs.patches or [ ]) ++ [
             ./0001-virgl_video-support-non-mesa-vaapi-drivers.patch
           ];
-          mesonFlags = (oldAttrs.mesonFlags or []) ++ [
-           (prev.lib.mesonBool "vaapi-all-drivers" true)
-          ];
-
         });
 
         # QEMU built from git HEAD, using our git virglrenderer, with full graphics stack
