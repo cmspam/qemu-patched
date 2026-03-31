@@ -42,6 +42,9 @@
           patches = (oldAttrs.patches or [ ]) ++ [
             ./0001-virgl_video-support-non-mesa-vaapi-drivers.patch
           ];
+          mesonFlags = (oldAttrs.mesonFlags or []) ++ [
+           (lib.mesonBool "vaapi-all-drivers" vaapiSupport)
+          ];
 
         });
 
