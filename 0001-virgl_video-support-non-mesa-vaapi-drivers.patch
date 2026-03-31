@@ -1,5 +1,5 @@
 --- virglrenderer-main/src/vrend/virgl_video.h	2026-03-26 15:55:06.000000000 +0000
-+++ virglrenderer-patched/src/vrend/virgl_video.h	2026-03-31 13:47:10.000000000 +0000
++++ virglrenderer-patched/src/vrend/virgl_video.h	2026-03-31 14:24:26.020311559 +0000
 @@ -72,9 +72,30 @@
      uint32_t width;
      uint32_t height;
@@ -31,6 +31,22 @@
  /* flags for virgl_video_dma_buffers */
  #define VIRGL_VIDEO_DMABUF_READ_ONLY        0x0001
  #define VIRGL_VIDEO_DMABUF_WRITE_ONLY       0x0002
+@@ -93,7 +114,14 @@
+         uint32_t drm_format;
+         int fd;
+         uint32_t size;
+-        int modifier;
++        /*
++         * DRM format modifier — MUST be uint64_t.
++         * Intel tiling modifiers (e.g. I915_FORMAT_MOD_4_TILED = 0x0200000000000009)
++         * have meaningful bits in the upper 32 bits; storing as int silently
++         * discards them and causes eglCreateImageKHR to fail or misinterpret
++         * the surface layout.
++         */
++        uint64_t modifier;
+         uint32_t offset;
+         uint32_t pitch;
+     } planes[4];
 --- virglrenderer-main/src/vrend/virgl_video.c	2026-03-26 15:55:06.000000000 +0000
 +++ virglrenderer-patched/src/vrend/virgl_video.c	2026-03-31 14:16:11.727510696 +0000
 @@ -67,6 +67,8 @@
@@ -849,3 +865,95 @@
      free(slice_data_buf);
  
      return err;
+--- virglrenderer-main/src/vrend/vrend_video.c	2026-03-26 15:55:06.000000000 +0000
++++ virglrenderer-patched/src/vrend/vrend_video.c	2026-03-31 14:24:26.021311558 +0000
+@@ -68,6 +68,16 @@
+ 
+ #include "virgl_video.h"
+ #include "virgl_video_hw.h"
++#include <drm_fourcc.h>
++
++/*
++ * EGL_EXT_image_dma_buf_import_modifiers attributes.
++ * Define locally so we don't depend on a specific eglext.h version.
++ */
++#ifndef EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT
++#  define EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT  0x3443
++#  define EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT  0x3444
++#endif
+ 
+ #include "vrend_debug.h"
+ #include "vrend_winsys.h"
+@@ -166,22 +176,63 @@
+ 
+         /* dmabuf -> eglimage */
+         if (EGL_NO_IMAGE_KHR == plane->egl_image) {
+-            EGLint img_attrs[16] = {
+-                EGL_LINUX_DRM_FOURCC_EXT,       dmabuf->planes[i].drm_format,
+-                EGL_WIDTH,                      dmabuf->width / (i + 1),
+-                EGL_HEIGHT,                     dmabuf->height / (i + 1),
+-                EGL_DMA_BUF_PLANE0_FD_EXT,      dmabuf->planes[i].fd,
+-                EGL_DMA_BUF_PLANE0_OFFSET_EXT,  dmabuf->planes[i].offset,
+-                EGL_DMA_BUF_PLANE0_PITCH_EXT,   dmabuf->planes[i].pitch,
+-                EGL_NONE
+-            };
++            /*
++             * Build EGL image attribute list.  Always include the DRM format
++             * modifier when it is set: Intel iHD and other non-Mesa drivers
++             * export decoded surfaces with non-linear tiling (e.g.
++             * I915_FORMAT_MOD_4_TILED on Xe hardware).  Without the modifier
++             * EGL either rejects the import or — worse — treats the tiled
++             * memory as linear, producing corrupted output or reading
++             * unrelated GPU memory (green frames, compositor content, etc.).
++             */
++            uint64_t modifier = dmabuf->planes[i].modifier;
++            EGLint img_attrs[22];
++            int attr_idx = 0;
++
++            img_attrs[attr_idx++] = EGL_LINUX_DRM_FOURCC_EXT;
++            img_attrs[attr_idx++] = (EGLint)dmabuf->planes[i].drm_format;
++            img_attrs[attr_idx++] = EGL_WIDTH;
++            img_attrs[attr_idx++] = (EGLint)(dmabuf->width  / (i + 1));
++            img_attrs[attr_idx++] = EGL_HEIGHT;
++            img_attrs[attr_idx++] = (EGLint)(dmabuf->height / (i + 1));
++            img_attrs[attr_idx++] = EGL_DMA_BUF_PLANE0_FD_EXT;
++            img_attrs[attr_idx++] = dmabuf->planes[i].fd;
++            img_attrs[attr_idx++] = EGL_DMA_BUF_PLANE0_OFFSET_EXT;
++            img_attrs[attr_idx++] = (EGLint)dmabuf->planes[i].offset;
++            img_attrs[attr_idx++] = EGL_DMA_BUF_PLANE0_PITCH_EXT;
++            img_attrs[attr_idx++] = (EGLint)dmabuf->planes[i].pitch;
++
++            if (modifier != DRM_FORMAT_MOD_INVALID) {
++                img_attrs[attr_idx++] = EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
++                img_attrs[attr_idx++] = (EGLint)(modifier & 0xffffffffu);
++                img_attrs[attr_idx++] = EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
++                img_attrs[attr_idx++] = (EGLint)(modifier >> 32);
++            }
++
++            img_attrs[attr_idx++] = EGL_NONE;
+ 
+             plane->egl_image = eglCreateImageKHR(eglGetCurrentDisplay(),
+                     EGL_NO_CONTEXT, EGL_LINUX_DMA_BUF_EXT, NULL, img_attrs);
++
++            if (EGL_NO_IMAGE_KHR == plane->egl_image) {
++                virgl_error("%s: eglCreateImageKHR failed for plane %u "
++                            "(fmt=0x%x modifier=0x%llx): EGL error 0x%x\n",
++                            __func__, i,
++                            dmabuf->planes[i].drm_format,
++                            (unsigned long long)modifier,
++                            eglGetError());
++            }
+         }
+ 
+         if (EGL_NO_IMAGE_KHR == plane->egl_image) {
+-            virgl_error("%s: create egl image failed\n", __func__);
++            /*
++             * Do NOT call glEGLImageTargetTexture2DOES with a null image —
++             * that is undefined behaviour and typically causes the GL texture
++             * to read from arbitrary GPU memory (the last framebuffer content,
++             * which is why you see compositor windows/clock instead of video).
++             */
++            virgl_error("%s: skipping plane %u — no valid EGL image\n",
++                        __func__, i);
+             continue;
+         }
