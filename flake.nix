@@ -39,6 +39,10 @@
         virglrenderer = prev.virglrenderer.overrideAttrs (oldAttrs: {
           version = "git-${virglrenderer-src.shortRev or virglrenderer-src.rev}";
           src = virglrenderer-src;
+          patches = (oldAttrs.patches or [ ]) ++ [
+            ./0001-virgl_video-support-non-mesa-vaapi-drivers.patch
+          ];
+
         });
 
         # QEMU built from git HEAD, using our git virglrenderer, with full graphics stack
