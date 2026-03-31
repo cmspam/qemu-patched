@@ -35,10 +35,24 @@
     {
       overlays.default = final: prev: {
 
-        # virglrenderer built from git HEAD
+        # virglrenderer built from git HEAD with MR!1268:
+        # "vrend: support linear gbm_bo blob resources for dGPU prime"
+        # This is the host-side counterpart to mesa MR!23896 -- without it,
+        # the guest can request a linear GBM-backed blob resource but the host
+        # virglrenderer won't create one, causing dmabuf import to fail.
         virglrenderer = prev.virglrenderer.overrideAttrs (oldAttrs: {
           version = "git-${virglrenderer-src.shortRev or virglrenderer-src.rev}";
           src = virglrenderer-src;
+
+          patches = (oldAttrs.patches or [ ]) ++ [
+            ./virglrenderer-mr1268-dgpu-prime.patch
+          ];
+
+          # GBM allocation must be enabled for the patch to activate --
+          # the key code paths are gated on ENABLE_GBM_ALLOCATION
+          mesonFlags = (oldAttrs.mesonFlags or [ ]) ++ [
+            "-Dminigbm_allocation=true"
+          ];
         });
 
         # QEMU built from git HEAD, using our git virglrenderer, with full graphics stack
