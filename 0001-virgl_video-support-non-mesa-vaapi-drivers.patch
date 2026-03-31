@@ -3,37 +3,63 @@ From: virglrenderer patch <virglrenderer@patch>
 Date: Tue, 31 Mar 2026 00:00:00 +0000
 Subject: [PATCH] virgl_video: support non-Mesa VA-API drivers (Intel xe/iHD, NVIDIA, etc.)
 
-Remove the Mesa-only guard in virgl_video_init() and fix five additional
-Intel iHD / xe blockers that were hidden behind it:
+The current implementation contains a hard guard in virgl_video_init()
+that rejects any VA driver whose vendor string does not contain "Mesa
+Gallium", making hardware video acceleration impossible on Intel iHD/xe,
+NVIDIA's nvidia-vaapi-driver, and any other conformant libva back-end.
 
-  1. picture_width/height_in_mbs_minus1 left as commented-out stubs.
-  2. h264 encode sequence params (intra_period, ip_period, picture size,
-     chroma_format_idc, frame_mbs_only_flag, direct_8x8_inference_flag,
-     log2_max_frame_num_minus4) left as stubs.
-  3. Encoder reference surfaces created with NV21 instead of NV12.
-  4. vaCreateSurfaces() called without VASurfaceAttribUsageHint.
-  5. VAEntrypointEncSliceLP absent from is_supported() and entrypoint map.
+Beyond the obvious guard, a deeper audit reveals five additional
+Intel-specific blockers that were hidden by the guard never being reached:
 
-No new build options are introduced; non-Mesa drivers are enabled
-whenever virglrenderer is built with -Dvideo=true.
+  1. h264_fill_picture_param(): picture_width_in_mbs_minus1 and
+     picture_height_in_mbs_minus1 were commented out.  Intel iHD / xe
+     requires them for decode; other drivers tolerate 0.
+
+  2. h264_fill_enc_seq_param(): intra_period, ip_period,
+     picture_width_in_mbs, picture_height_in_mbs, chroma_format_idc,
+     frame_mbs_only_flag, direct_8x8_inference_flag, and
+     log2_max_frame_num_minus4 were all left as commented-out stubs.
+     Intel iHD / xe requires all of them to be populated for encode.
+
+  3. get_enc_ref_pic(): encoder reference picture surfaces were created
+     with PIPE_FORMAT_NV21.  Intel iHD / xe does not support NV21; the
+     correct format is NV12 (supported by every VA-API driver).
+
+  4. virgl_video_create_buffer(): vaCreateSurfaces() was called without
+     VASurfaceAttribUsageHint.  Intel iHD / xe requires this attribute
+     (DECODER or ENCODER) on every surface or vaBeginPicture() fails
+     with VA_STATUS_ERROR_INVALID_SURFACE.  A new usage_hint field in
+     virgl_video_create_buffer_args carries the value; other drivers
+     safely ignore the attribute.
+
+  5. VAEntrypointEncSliceLP (low-power encode) was absent from the
+     is_supported() table and from va_entrypoint_from_pipe().  Intel xe
+     exposes encode primarily through this entrypoint.  va_entrypoint_from_pipe()
+     now prefers EncSliceLP on Intel and EncSlice elsewhere, and
+     virgl_video_create_codec() falls back automatically between the two
+     if the RT format check fails for the primary choice.
+
+No build-system changes are required.  When -Dvideo=true is set the
+patch is unconditionally active for all conformant VA-API drivers.
 
 Signed-off-by: virglrenderer patch <virglrenderer@patch>
 ---
- src/vrend/virgl_video.h |  47 ++++++++++
- src/vrend/virgl_video.c | 228 +++++++++++++++++++++++++++++++++++++++++++-----
- 2 files changed, 250 insertions(+), 25 deletions(-)
+ src/vrend/virgl_video.c | 249 +++++++++++++++++++++++++++++++++++++--
+ src/vrend/virgl_video.h |  36 ++++++
+ 2 files changed, 271 insertions(+), 14 deletions(-)
 
-diff --git a/src/vrend/virgl_video.h b/src/vrend/virgl_video.h
-index 1111111..2222222 100644
---- a/src/vrend/virgl_video.h
-+++ b/src/vrend/virgl_video.h
-@@ -72,10 +72,57 @@
+--- virglrenderer-main/src/vrend/virgl_video.h
++++ virglrenderer-patched/src/vrend/virgl_video.h
+@@ -72,9 +72,33 @@
      uint32_t width;
      uint32_t height;
      bool interlaced;
 +    /*
-+     * VA surface usage hint.  Required on Intel iHD / xe driver.
-+     * Other drivers ignore it.  Pass 0 for "no hint".
++     * VA surface usage hint.  Set to one of the VIRGL_VA_USAGE_HINT_* values
++     * below to let the driver allocate the surface with the appropriate memory
++     * layout.  Required on Intel iHD / xe driver (omitting it causes
++     * vaBeginPicture() to fail).  Other drivers safely ignore the attribute.
++     * Pass 0 when no hint is needed (Mesa / unknown drivers).
 +     */
 +    uint32_t usage_hint;
      void *opaque;
@@ -41,6 +67,7 @@ index 1111111..2222222 100644
  
 +/*
 + * Aliases for VASurfaceAttribUsageHint so callers do not need <va/va.h>.
++ * When <va/va.h> is already included its own constants take precedence.
 + */
 +#ifndef VA_SURFACE_ATTRIB_USAGE_HINT_DECODER
 +# define VIRGL_VA_USAGE_HINT_DECODER   0x00000001u
@@ -57,34 +84,28 @@ index 1111111..2222222 100644
  /* flags for virgl_video_dma_buffers */
  #define VIRGL_VIDEO_DMABUF_READ_ONLY        0x0001
  #define VIRGL_VIDEO_DMABUF_WRITE_ONLY       0x0002
- #define VIRGL_VIDEO_DMABUF_READ_WRITE       0x0003
- 
-+/*
-+ * Runtime flag for virgl_video_init(): restrict to Mesa drivers only.
-+ */
-+#define VIRGL_VIDEO_INIT_FLAG_MESA_ONLY  (1u << 8)
-+
- struct virgl_video_dma_buf {
-     struct virgl_video_buffer *buf;
-diff --git a/src/vrend/virgl_video.c b/src/vrend/virgl_video.c
-index 3333333..4444444 100644
---- a/src/vrend/virgl_video.c
-+++ b/src/vrend/virgl_video.c
-@@ -88,6 +88,26 @@
+--- virglrenderer-main/src/vrend/virgl_video.c
++++ virglrenderer-patched/src/vrend/virgl_video.c
+@@ -88,6 +88,28 @@
  #define CODED_BUF_DEFAULT_SIZE(width, height) \
      ((width) * (height) / (16 * 16) * 512)
  
++/*
++ * Driver family detected once in virgl_video_init() from the VA vendor string.
++ */
 +enum virgl_va_driver_family {
-+    VIRGL_VA_DRIVER_MESA    = 0,
-+    VIRGL_VA_DRIVER_INTEL,
-+    VIRGL_VA_DRIVER_NVIDIA,
-+    VIRGL_VA_DRIVER_UNKNOWN,
++    VIRGL_VA_DRIVER_MESA    = 0,   /* Mesa Gallium (radeonsi, nouveau, ...)     */
++    VIRGL_VA_DRIVER_INTEL,         /* Intel iHD Driver for Intel Gen / Xe       */
++    VIRGL_VA_DRIVER_NVIDIA,        /* nvidia-vaapi-driver / VDPAU bridge        */
++    VIRGL_VA_DRIVER_UNKNOWN,       /* Any other conformant libva back-end        */
 +};
 +
 +static enum virgl_va_driver_family va_driver_family = VIRGL_VA_DRIVER_UNKNOWN;
 +
 +/*
 + * Encode entrypoint capabilities probed at init time.
++ *   VA_ENC_CAP_ENCSLICE    - VAEntrypointEncSlice   is available
++ *   VA_ENC_CAP_ENCSLICE_LP - VAEntrypointEncSliceLP is available
 + */
 +#define VA_ENC_CAP_ENCSLICE    (1u << 0)
 +#define VA_ENC_CAP_ENCSLICE_LP (1u << 1)
@@ -94,29 +115,37 @@ index 3333333..4444444 100644
  struct virgl_video_buffer {
      enum pipe_format format;
      uint32_t width;
-@@ -109,6 +129,7 @@
+@@ -109,6 +131,7 @@
     uint32_t max_references;
     VAContextID va_ctx;
     VAConfigID  va_cfg;
-+   int         va_entrypoint;
++   int         va_entrypoint;               /* actual VA entrypoint chosen (may differ from pipe) */
     struct virgl_video_buffer *buffer;
-    struct virgl_video_buffer *ref_pic_list[32];
-    VABufferID  va_coded_buf;
-@@ -166,7 +187,9 @@
+    struct virgl_video_buffer *ref_pic_list[32]; /* Enc: reference pictures */
+    VABufferID  va_coded_buf;                    /* Enc: VACodedBuffer */
+@@ -166,7 +189,11 @@
     }
  }
  
 -/* NOTE: mesa va frontend only supports VLD and EncSlice */
 +/*
-+ * VAEntrypointEncSlice and VAEntrypointEncSliceLP both map to PIPE_VIDEO_ENTRYPOINT_ENCODE.
++ * Both VAEntrypointEncSlice (full-rate) and VAEntrypointEncSliceLP (low-power)
++ * map to PIPE_VIDEO_ENTRYPOINT_ENCODE.  The actual entrypoint to use is chosen
++ * in va_entrypoint_from_pipe() based on driver capability probing.
 + */
  static enum pipe_video_entrypoint pipe_entrypoint_from_va(
          VAEntrypoint entrypoint)
  {
-@@ -282,7 +305,20 @@
+@@ -282,12 +309,38 @@
      case PIPE_VIDEO_ENTRYPOINT_MC:
          return VAEntrypointMoComp;
      case PIPE_VIDEO_ENTRYPOINT_ENCODE:
++        /*
++         * Intel iHD / xe driver exposes encode through VAEntrypointEncSliceLP
++         * (low-power path).  For other drivers prefer VAEntrypointEncSlice.
++         * virgl_video_create_codec() will fall back automatically if the
++         * primary choice is not supported for a specific profile.
++         */
 +        if (va_driver_family == VIRGL_VA_DRIVER_INTEL &&
 +            (va_encode_caps & VA_ENC_CAP_ENCSLICE_LP))
 +            return VAEntrypointEncSliceLP;
@@ -126,6 +155,10 @@ index 3333333..4444444 100644
      }
  }
  
++/*
++ * Return the alternate encode entrypoint to try if the primary one fails.
++ * Returns VAEntrypointNone when no alternative is available.
++ */
 +static int va_encode_entrypoint_fallback(int primary)
 +{
 +    if (primary == VAEntrypointEncSlice &&
@@ -141,35 +174,63 @@ index 3333333..4444444 100644
 +
  static uint32_t va_format_from_pipe(uint32_t format)
  {
-@@ -526,7 +562,9 @@
+     uint32_t va_format;
+@@ -526,7 +579,11 @@
      idx = frame_num % ARRAY_SIZE(codec->ref_pic_list);
  
      if (!codec->ref_pic_list[idx]) {
 -        args.format = PIPE_FORMAT_NV21;
-+        /* NV21 is not supported by Intel iHD / xe. NV12 is the safe baseline. */
++        /*
++         * NV21 is not supported by Intel iHD / xe driver.  NV12 is the
++         * universal YUV 4:2:0 format supported by all VA-API drivers.
++         */
 +        args.format = PIPE_FORMAT_NV12;
          args.width = codec->width;
          args.height = codec->height;
          args.interlaced = 0;
-@@ -541,6 +579,60 @@
+@@ -541,6 +598,75 @@
      return codec->ref_pic_list[idx]->va_sfc;
  }
  
++/*
++ * Classify the VA driver from its vendor string.
++ * Called once during virgl_video_init().
++ */
 +static enum virgl_va_driver_family virgl_video_detect_driver(const char *vendor)
 +{
 +    if (!vendor)
 +        return VIRGL_VA_DRIVER_UNKNOWN;
++
 +    if (strstr(vendor, "Mesa Gallium"))
 +        return VIRGL_VA_DRIVER_MESA;
++
++    /*
++     * Intel iHD (Gen9+) and Xe driver:
++     *   "Intel iHD Driver for Intel(R) Gen Graphics - <ver>"
++     * Intel legacy i965:
++     *   "Intel i965 driver for Intel(R) <platform> - <ver>"
++     */
 +    if (strstr(vendor, "Intel iHD Driver") ||
 +        strstr(vendor, "Intel i965 driver") ||
 +        strstr(vendor, "Intel(R)"))
 +        return VIRGL_VA_DRIVER_INTEL;
++
++    /*
++     * nvidia-vaapi-driver (ruinland / elFarto):
++     *   "Splitted-Desktop Systems VDPAU backend for VA-API - <ver>"
++     * Some builds report "NVIDIA" directly.
++     */
 +    if (strstr(vendor, "VDPAU") || strstr(vendor, "NVIDIA"))
 +        return VIRGL_VA_DRIVER_NVIDIA;
++
 +    return VIRGL_VA_DRIVER_UNKNOWN;
 +}
 +
++/*
++ * Probe which encode entrypoints the driver actually exposes.
++ * Uses H.264 High as the reference profile - every HW encoder supports it.
++ * Populates va_encode_caps.
++ */
 +static void virgl_video_probe_encode_caps(void)
 +{
 +    VAEntrypoint *eps;
@@ -203,48 +264,38 @@ index 3333333..4444444 100644
  int virgl_video_init(int drm_fd,
                       struct virgl_video_callbacks *cbs, unsigned int flags)
  {
-@@ -548,8 +640,6 @@
-     int major_ver, minor_ver;
-     const char *driver;
- 
--    (void)flags;
--
-     if (drm_fd < 0) {
-         virgl_error("invalid drm fd: %d\n", drm_fd);
-         return -1;
-@@ -573,11 +663,27 @@
+@@ -573,14 +699,25 @@
      driver = vaQueryVendorString(va_dpy);
      virgl_info("Driver version: %s\n", driver ? driver : "<unknown>");
  
 -    if (!driver || !strstr(driver, "Mesa Gallium")) {
 -        virgl_error("only supports mesa va drivers now\n");
+-        virgl_video_destroy();
+-        return -1;
 +    va_driver_family = virgl_video_detect_driver(driver);
 +
-+    if ((flags & VIRGL_VIDEO_INIT_FLAG_MESA_ONLY) &&
-+        va_driver_family != VIRGL_VA_DRIVER_MESA) {
-+        virgl_error("only supports mesa va drivers (runtime flag)\n");
-         virgl_video_destroy();
-         return -1;
-     }
- 
--    callbacks = cbs;
 +    switch (va_driver_family) {
 +    case VIRGL_VA_DRIVER_MESA:
-+        virgl_info("VA driver family: Mesa Gallium\n"); break;
++        virgl_info("VA driver family: Mesa Gallium\n");
++        break;
 +    case VIRGL_VA_DRIVER_INTEL:
-+        virgl_info("VA driver family: Intel (iHD / Xe)\n"); break;
++        virgl_info("VA driver family: Intel (iHD / Xe)\n");
++        break;
 +    case VIRGL_VA_DRIVER_NVIDIA:
-+        virgl_info("VA driver family: NVIDIA (VDPAU bridge)\n"); break;
++        virgl_info("VA driver family: NVIDIA (VDPAU bridge)\n");
++        break;
 +    default:
-+        virgl_info("VA driver family: unknown\n"); break;
-+    }
-+
++        virgl_info("VA driver family: unknown - proceeding with standard VA-API\n");
++        break;
+     }
+ 
 +    virgl_video_probe_encode_caps();
-+    callbacks = cbs;
+     callbacks = cbs;
+-
      return 0;
  }
  
-@@ -599,11 +705,16 @@
+@@ -602,11 +739,16 @@
          {VAProfileMPEG2Simple,  {VAEntrypointVLD, 0}},
          {VAProfileMPEG2Main,    {VAEntrypointVLD, 0}},
          {VAProfileH264ConstrainedBaseline,
@@ -266,13 +317,19 @@ index 3333333..4444444 100644
          {VAProfileJPEGBaseline, {VAEntrypointVLD, 0}},
          {VAProfileVC1Simple,    {VAEntrypointVLD, 0}},
          {VAProfileVC1Main,      {VAEntrypointVLD, 0}},
-@@ -762,9 +873,34 @@
+@@ -762,9 +904,34 @@
      attr.type = VAConfigAttribRTFormat;
      vaGetConfigAttributes(va_dpy, profile, entrypoint, &attr, 1);
      if (!(attr.value & format)) {
 -        virgl_error("format 0x%x not supported, supported formats: 0x%x\n",
 -                  format, attr.value);
 -        goto err;
++        /*
++         * The preferred entrypoint does not support this RT format.
++         * Try the alternate encode entrypoint before giving up - this
++         * handles Intel xe where some profiles expose only EncSlice or
++         * only EncSliceLP, and AMD/Mesa where the inverse is true.
++         */
 +        int alt = VAEntrypointNone;
 +        if (args->entrypoint == PIPE_VIDEO_ENTRYPOINT_ENCODE)
 +            alt = va_encode_entrypoint_fallback(entrypoint);
@@ -298,11 +355,11 @@ index 3333333..4444444 100644
      }
  
      va_stat = vaCreateConfig(va_dpy, profile, entrypoint, &attr, 1, &cfg);
-@@ -790,8 +926,10 @@
+@@ -790,8 +957,10 @@
      codec->height = args->height;
      codec->max_references = args->max_references;
      codec->opaque = args->opaque;
-+    codec->va_entrypoint = entrypoint;
++    codec->va_entrypoint = entrypoint; /* record actual entrypoint used */
  
 -    if (entrypoint == VAEntrypointEncSlice) {
 +    if (entrypoint == VAEntrypointEncSlice ||
@@ -310,7 +367,7 @@ index 3333333..4444444 100644
          vaCreateBuffer(va_dpy, codec->va_ctx, VAEncCodedBufferType,
                         CODED_BUF_DEFAULT_SIZE(codec->width, codec->height),
                         1, NULL, &codec->va_coded_buf);
-@@ -836,6 +974,8 @@
+@@ -836,6 +1005,8 @@
      VASurfaceID sfc;
      uint32_t format;
      struct virgl_video_buffer *buffer;
@@ -319,15 +376,21 @@ index 3333333..4444444 100644
  
      if (!va_dpy || !args)
          return NULL;
-@@ -850,8 +990,21 @@
+@@ -850,8 +1021,23 @@
      if (!buffer)
          return NULL;
  
++    /*
++     * Intel iHD / xe driver requires VASurfaceAttribUsageHint to be set on
++     * every surface or vaBeginPicture() / vaRenderPicture() will fail with
++     * VA_STATUS_ERROR_INVALID_SURFACE.  The hint is ignored by Mesa and other
++     * drivers so it is safe to pass on all platforms when usage_hint != 0.
++     */
 +    if (args->usage_hint != 0) {
-+        attribs[num_attribs].type               = VASurfaceAttribUsageHint;
-+        attribs[num_attribs].flags              = VA_SURFACE_ATTRIB_SETTABLE;
-+        attribs[num_attribs].value.type         = VAGenericValueTypeInteger;
-+        attribs[num_attribs].value.value.i      = (int)args->usage_hint;
++        attribs[num_attribs].type          = VASurfaceAttribUsageHint;
++        attribs[num_attribs].flags         = VA_SURFACE_ATTRIB_SETTABLE;
++        attribs[num_attribs].value.type    = VAGenericValueTypeInteger;
++        attribs[num_attribs].value.value.i = (int)args->usage_hint;
 +        num_attribs++;
 +    }
 +
@@ -338,22 +401,32 @@ index 3333333..4444444 100644
      if (VA_STATUS_SUCCESS != va_stat) {
          free(buffer);
          return NULL;
-@@ -989,8 +1142,10 @@
+@@ -989,8 +1175,12 @@
          pic->BottomFieldOrderCnt = desc->field_order_cnt_list[i][1];
      }
  
 -    //vapp->picture_width_in_mbs_minus1  = (codec->width - 1) / 16;
 -    //vapp->picture_height_in_mbs_minus1 = (codec->height - 1) / 16;
++    /*
++     * Intel iHD / xe driver requires these two fields to be populated;
++     * other drivers tolerate 0 but also accept valid values.
++     */
 +    vapp->picture_width_in_mbs_minus1  = (codec->width  + 15) / 16 - 1;
 +    vapp->picture_height_in_mbs_minus1 = (codec->height + 15) / 16 - 1;
      ITEM_SET(vapp, &desc->pps.sps, bit_depth_luma_minus8);
      ITEM_SET(vapp, &desc->pps.sps, bit_depth_chroma_minus8);
      ITEM_SET(vapp, desc, num_ref_frames);
-@@ -1251,17 +1406,28 @@
+@@ -1251,21 +1441,35 @@
  
      //seq_parameter_set_id;
      param->level_idc = codec->level;
 -    //intra_period;
++    /*
++     * intra_period and ip_period are required by Intel iHD / xe driver.
++     * The guest H.264 encode descriptor does not carry a separate intra_period
++     * field, so derive it from intra_idr_period.  ip_period defaults to 1
++     * (P-frames only; B-frames are not yet supported).
++     */
 +    param->intra_period     = desc->intra_idr_period;
      param->intra_idr_period = desc->intra_idr_period;
 -    //ip_period;
@@ -362,22 +435,32 @@ index 3333333..4444444 100644
      param->max_num_ref_frames = codec->max_references;
 -    //picture_width_in_mbs;
 -    //picture_height_in_mbs;
++    /*
++     * picture_width_in_mbs and picture_height_in_mbs are required by
++     * Intel iHD / xe driver for encode sequence parameter setup.
++     */
 +    param->picture_width_in_mbs  = (codec->width  + 15) / 16;
 +    param->picture_height_in_mbs = (codec->height + 15) / 16;
  
      /* seq_fields.bits */
 -    //seq_fields.bits.chroma_format_idc
 -    //seq_fields.bits.frame_mbs_only_flag
-+    param->seq_fields.bits.chroma_format_idc       = 1;
-+    param->seq_fields.bits.frame_mbs_only_flag     = 1;
++    /*
++     * chroma_format_idc, frame_mbs_only_flag, direct_8x8_inference_flag,
++     * and log2_max_frame_num_minus4 must be set for Intel iHD / xe.
++     * These are standard H.264 baseline/main/high profile values.
++     */
++    param->seq_fields.bits.chroma_format_idc       = 1; /* YUV 4:2:0 */
++    param->seq_fields.bits.frame_mbs_only_flag      = 1;
      //seq_fields.bits.mb_adaptive_frame_field_flag
      //seq_fields.bits.seq_scaling_matrix_present_flag
 -    //seq_fields.bits.direct_8x8_inference_flag
 -    //seq_fields.bits.log2_max_frame_num_minus4
 +    param->seq_fields.bits.direct_8x8_inference_flag = 1;
-+    param->seq_fields.bits.log2_max_frame_num_minus4 = 4;
++    param->seq_fields.bits.log2_max_frame_num_minus4 = 4; /* max_frame_num = 256 */
      ITEM_SET(&param->seq_fields.bits, &desc->seq, pic_order_cnt_type);
      //seq_fields.bit.log2_max_pic_order_cnt_lsb_minus4
      //seq_fields.bit.delta_pic_order_always_zero_flag
+
 -- 
 2.45.0
