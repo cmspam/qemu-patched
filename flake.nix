@@ -45,7 +45,7 @@
           src = virglrenderer-src;
 
           patches = (oldAttrs.patches or [ ]) ++ [
-            ./virglrenderer-mr1268-dgpu-prime.patch
+            ./virglrenderer-xe-native-context.patch
           ];
 
           # GBM allocation must be enabled for the patch to activate --
