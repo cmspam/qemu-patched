@@ -1,43 +1,20 @@
-From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
-From: Developer <dev@example.com>
-Date: Wed, 01 Apr 2026 00:48:21 +0000
-Subject: [PATCH 1/1] drm/xe: add Xe native context for virglrenderer
-
-Implements the host-side virglrenderer native context for the Intel Xe
-GPU driver (xe.ko).  Guest userspace (ANV under virtio-gpu) communicates
-with the host through the xe_virtio ccmd protocol defined in xe_proto.h.
-
-New files added under src/drm/xe/:
-  xe_proto.h           - shared guest/host wire protocol structs
-  xe_ccmd.h / .c       - handlers for all 8 protocol commands
-  xe_object.h / .c     - GEM object wrapper (cpu_caching -> map_info)
-  xe_resource.h / .c   - virgl blob / attach / export helpers
-  xe_renderer.h / .c   - context probe / create / destroy / submit_fence
-  ../drm-uapi/xe_drm.h - vendored Xe kernel uAPI header
-
-Protocol commands implemented:
-  XE_CCMD_DEVICE_QUERY        proxy for DRM_IOCTL_XE_DEVICE_QUERY (2-phase)
-  XE_CCMD_GEM_CREATE          create GEM BO linked to a virgl blob
-  XE_CCMD_VM_CREATE           create Xe VM; host returns vm_id
-  XE_CCMD_VM_DESTROY          destroy Xe VM
-  XE_CCMD_VM_BIND             synchronous VM bind (res_id -> gem handle)
-  XE_CCMD_EXEC_QUEUE_CREATE   create exec queue + per-queue drm_timeline
-  XE_CCMD_EXEC_QUEUE_DESTROY  drain timeline and destroy exec queue
-  XE_CCMD_EXEC                submit batch; host syncobj feeds drm_timeline
-
-Design notes:
-  - VM bind is always synchronous; ordering is guaranteed by the ccmd seqno.
-  - EXEC creates a temporary DRM syncobj as out-sync, calls XE_EXEC, then
-    exports the sync-fd into the per-queue drm_timeline for virgl fences.
-  - Exec queues are tracked in a u32 -> drm_timeline* hash table.
-  - submit_fence() uses exec_queue_id directly as the ring_idx.
-  - Enable with meson option: -Ddrm-renderers=xe-experimental
-
-Signed-off-by: Developer <dev@example.com>
----
+diff --git a/config.h.meson b/config.h.meson
+index 55497ffb..9a26cb59 100644
+--- a/config.h.meson
++++ b/config.h.meson
+@@ -44,6 +44,7 @@
+ #mesondefine ENABLE_DRM_ASAHI
+ #mesondefine ENABLE_DRM_PANFROST
+ #mesondefine ENABLE_DRM_I915
++#mesondefine ENABLE_DRM_XE
+ #mesondefine ENABLE_LIBDRM
+ #mesondefine ENABLE_RENDER_SERVER
+ #mesondefine ENABLE_RENDER_SERVER_WORKER_PROCESS
+diff --git a/meson.build b/meson.build
+index 8e1c0767..631d008f 100644
 --- a/meson.build
 +++ b/meson.build
-@@ -129,6 +129,11 @@
+@@ -129,6 +129,11 @@ if with_drm_i915
    conf_data.set('ENABLE_DRM_I915', 1)
  endif
  
@@ -49,7 +26,7 @@ Signed-off-by: Developer <dev@example.com>
  with_drm_renderers = drm_renderers.length() > 0
  
  if with_drm_renderers
-@@ -460,6 +465,7 @@
+@@ -460,6 +465,7 @@ summary({'c_args': (' ').join(get_option('c_args')),
          'drm-amdgpu': with_drm_amdgpu,
          'drm-asahi': with_drm_asahi,
          'drm-i915': with_drm_i915,
@@ -57,9 +34,11 @@ Signed-off-by: Developer <dev@example.com>
          'drm-panfrost': with_drm_panfrost,
          'drm-msm': with_drm_msm,
          'render server worker': with_render_server ? with_render_server_worker : 'none',
+diff --git a/meson_options.txt b/meson_options.txt
+index e7e67d91..a5a44342 100644
 --- a/meson_options.txt
 +++ b/meson_options.txt
-@@ -81,6 +81,7 @@
+@@ -81,6 +81,7 @@ option(
      'asahi',
      'msm',
      'i915-experimental',
@@ -67,116 +46,11 @@ Signed-off-by: Developer <dev@example.com>
    ],
    description : 'List of drm native-context renderers to build'
  )
---- a/config.h.meson
-+++ b/config.h.meson
-@@ -44,6 +44,7 @@
- #mesondefine ENABLE_DRM_ASAHI
- #mesondefine ENABLE_DRM_PANFROST
- #mesondefine ENABLE_DRM_I915
-+#mesondefine ENABLE_DRM_XE
- #mesondefine ENABLE_LIBDRM
- #mesondefine ENABLE_RENDER_SERVER
- #mesondefine ENABLE_RENDER_SERVER_WORKER_PROCESS
---- a/src/meson.build
-+++ b/src/meson.build
-@@ -145,6 +145,19 @@
-    'drm/i915/i915_renderer.h',
- ]
- 
-+drm_xe_sources = [
-+   'drm/drm-uapi/xe_drm.h',
-+   'drm/xe/xe_proto.h',
-+   'drm/xe/xe_ccmd.c',
-+   'drm/xe/xe_ccmd.h',
-+   'drm/xe/xe_object.c',
-+   'drm/xe/xe_object.h',
-+   'drm/xe/xe_resource.c',
-+   'drm/xe/xe_resource.h',
-+   'drm/xe/xe_renderer.c',
-+   'drm/xe/xe_renderer.h',
-+]
-+
- proxy_sources = [
-    'proxy/proxy_client.c',
-    'proxy/proxy_common.c',
-@@ -227,6 +240,10 @@
-    virgl_sources += drm_i915_sources
- endif
- 
-+if with_drm_xe
-+   virgl_sources += drm_xe_sources
-+endif
-+
- if with_render_server
-    virgl_sources += proxy_sources
- endif
---- a/src/drm_hw.h
-+++ b/src/drm_hw.h
-@@ -33,6 +33,7 @@
- #define VIRTGPU_DRM_CONTEXT_I915     3
- #define VIRTGPU_DRM_CONTEXT_ASAHI    4
- #define VIRTGPU_DRM_CONTEXT_PANFROST 5
-+#define VIRTGPU_DRM_CONTEXT_XE       6
-    uint32_t context_type;
-    uint32_t pad;
-    union {
-@@ -71,6 +72,14 @@
-          uint32_t pci_domain;
-          uint32_t pci_device_id;
-       } intel;  /* context_type == VIRTGPU_DRM_CONTEXT_I915 */
-+      struct {
-+         uint32_t pci_bus;
-+         uint32_t pci_dev;
-+         uint32_t pci_func;
-+         uint32_t pci_revision_id;
-+         uint32_t pci_domain;
-+         uint32_t pci_device_id;
-+      } xe;     /* context_type == VIRTGPU_DRM_CONTEXT_XE */
-    } u;
- };
- 
---- a/src/virglrenderer.c
-+++ b/src/virglrenderer.c
-@@ -573,7 +573,7 @@
-       *max_size = proxy_get_capset(cap_set, NULL);
-       break;
-    case VIRTGPU_DRM_CAPSET_DRM:
--      *max_ver = 0;
-+      *max_ver = 1;
-       *max_size = drm_renderer_capset(NULL);
-       break;
-    default:
---- a/src/drm/drm_renderer.c
-+++ b/src/drm/drm_renderer.c
-@@ -38,6 +38,10 @@
- #  include "i915/i915_renderer.h"
- #endif
- 
-+#ifdef ENABLE_DRM_XE
-+#  include "xe/xe_renderer.h"
-+#endif
-+
- static struct virgl_renderer_capset_drm capset;
- 
- static const struct backend {
-@@ -86,6 +90,15 @@
-       .create = i915_renderer_create,
-    },
- #endif
-+
-+#ifdef ENABLE_DRM_XE
-+   {
-+      .context_type = VIRTGPU_DRM_CONTEXT_XE,
-+      .name = "xe",
-+      .probe = xe_renderer_probe,
-+      .create = xe_renderer_create,
-+   },
-+#endif
- };
- 
- int
---- a/src/drm/drm-uapi/xe_drm.h	2026-04-01 00:29:31.497961298 +0000
-+++ b/src/drm/drm-uapi/xe_drm.h	2026-03-31 18:35:39.000000000 +0000
+diff --git a/src/drm/drm-uapi/xe_drm.h b/src/drm/drm-uapi/xe_drm.h
+new file mode 100644
+index 00000000..739a3cca
+--- /dev/null
++++ b/src/drm/drm-uapi/xe_drm.h
 @@ -0,0 +1,369 @@
 +/* SPDX-License-Identifier: MIT */
 +/* Copyright © 2023 Intel Corporation — vendored from kernel uapi */
@@ -547,308 +421,42 @@ Signed-off-by: Developer <dev@example.com>
 +#endif
 +
 +#endif /* _UAPI_XE_DRM_H_ */
---- a/src/drm/xe/xe_proto.h	2026-04-01 00:29:31.497961298 +0000
-+++ b/src/drm/xe/xe_proto.h	2026-03-31 19:27:31.000000000 +0000
-@@ -0,0 +1,275 @@
-+/*
-+ * Copyright 2025 Google LLC
-+ * SPDX-License-Identifier: MIT
-+ *
-+ * xe_proto.h — shared protocol between the guest Mesa Xe virtio driver
-+ * and the virglrenderer host-side Xe native context.
-+ *
-+ * All structs must be:
-+ *  - A multiple of 8 bytes in size
-+ *  - Aligned to at most 8 bytes
-+ * This is enforced by XE_STATIC_ASSERT_SIZE().
-+ */
-+
-+#ifndef XE_VIRTIO_PROTO_H_
-+#define XE_VIRTIO_PROTO_H_
-+
-+
-+
-+#ifdef __GNUC__
-+#  pragma GCC diagnostic push
-+#  pragma GCC diagnostic error "-Wpadded"
+diff --git a/src/drm/drm_renderer.c b/src/drm/drm_renderer.c
+index 3eb33e9b..0b81a183 100644
+--- a/src/drm/drm_renderer.c
++++ b/src/drm/drm_renderer.c
+@@ -38,6 +38,10 @@
+ #  include "i915/i915_renderer.h"
+ #endif
+ 
++#ifdef ENABLE_DRM_XE
++#  include "xe/xe_renderer.h"
 +#endif
 +
-+#define XE_STATIC_ASSERT_SIZE(t)                                              \
-+   static_assert(sizeof(struct t) % 8 == 0,                                  \
-+                 "sizeof(struct " #t ") not multiple of 8");                  \
-+   static_assert(alignof(struct t) <= 8,                                      \
-+                 "alignof(struct " #t ") too large");
+ static struct virgl_renderer_capset_drm capset;
+ 
+ static const struct backend {
+@@ -86,6 +90,15 @@ static const struct backend {
+       .create = i915_renderer_create,
+    },
+ #endif
 +
-+#define XE_DEFINE_CAST(parent, child)                                         \
-+   XE_STATIC_ASSERT_SIZE(child)                                               \
-+   DEFINE_CAST(parent, child)
-+
-+/* -------------------------------------------------------------------------
-+ * Command opcodes
-+ * ------------------------------------------------------------------------- */
-+
-+enum xe_ccmd {
-+   XE_CCMD_NOP              = 0,  /* unused; opcodes start at 1 */
-+   XE_CCMD_DEVICE_QUERY     = 1,  /* DRM_IOCTL_XE_DEVICE_QUERY          */
-+   XE_CCMD_GEM_CREATE       = 2,  /* DRM_IOCTL_XE_GEM_CREATE             */
-+   XE_CCMD_VM_CREATE        = 3,  /* DRM_IOCTL_XE_VM_CREATE              */
-+   XE_CCMD_VM_DESTROY       = 4,  /* DRM_IOCTL_XE_VM_DESTROY             */
-+   XE_CCMD_VM_BIND          = 5,  /* DRM_IOCTL_XE_VM_BIND                */
-+   XE_CCMD_EXEC_QUEUE_CREATE  = 6, /* DRM_IOCTL_XE_EXEC_QUEUE_CREATE     */
-+   XE_CCMD_EXEC_QUEUE_DESTROY = 7, /* DRM_IOCTL_XE_EXEC_QUEUE_DESTROY    */
-+   XE_CCMD_EXEC             = 8,  /* DRM_IOCTL_XE_EXEC                   */
-+};
-+
-+#define XE_CCMD(_cmd, _len) (struct vdrm_ccmd_req){  \
-+      .cmd = XE_CCMD_##_cmd,                          \
-+      .len = (_len),                                  \
-+   }
-+
-+/* -------------------------------------------------------------------------
-+ * Shmem layout (host → guest shared memory)
-+ * ------------------------------------------------------------------------- */
-+
-+/**
-+ * struct xe_shmem - layout of the shmem blob used for host→guest comms.
-+ *
-+ * Placed at the start of the blob returned by get_blob(blob_id=0).
-+ * The response ring starts at offset shmem->base.rsp_mem_offset.
-+ */
-+struct xe_shmem {
-+   struct vdrm_shmem base;
-+
-+   /**
-+    * @error_mask: bitmask of exec_queue_ids that have been banned by
-+    * the kernel.  Bit N set means exec_queue_id N is banned.
-+    * Updated atomically by the host; polled by the guest.
-+    * Limited to the first 64 exec queue ids for simplicity.
-+    */
-+   uint64_t banned_exec_queue_mask;
-+};
-+DEFINE_CAST(vdrm_shmem, xe_shmem)
-+
-+/* -------------------------------------------------------------------------
-+ * XE_CCMD_DEVICE_QUERY
-+ *
-+ * Proxies DRM_IOCTL_XE_DEVICE_QUERY to the host.  Two-phase like the
-+ * kernel ioctl: first call with size=0 to get required size, second with
-+ * the full size to retrieve data.
-+ * ------------------------------------------------------------------------- */
-+
-+struct xe_ccmd_device_query_req {
-+   struct vdrm_ccmd_req hdr;
-+
-+   uint32_t query;   /* DRM_XE_DEVICE_QUERY_* */
-+   uint32_t size;    /* requested payload size (0 = probe) */
-+};
-+XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_device_query_req)
-+
-+struct xe_ccmd_device_query_rsp {
-+   struct vdrm_ccmd_rsp hdr;
-+
-+   uint32_t pad;
-+   int32_t  ret;      /* errno on failure, 0 on success */
-+   uint32_t size;     /* actual payload size written */
-+   uint8_t  payload[]; /* query data (variable length, padded to 8B) */
-+};
-+XE_STATIC_ASSERT_SIZE(xe_ccmd_device_query_rsp)
-+
-+/* -------------------------------------------------------------------------
-+ * XE_CCMD_GEM_CREATE
-+ *
-+ * Creates a GEM BO on the host and associates it with blob_id so that
-+ * get_blob() can later retrieve a virgl resource handle for it.
-+ * No response is needed; errors are surfaced through get_blob().
-+ * ------------------------------------------------------------------------- */
-+
-+struct xe_ccmd_gem_create_req {
-+   struct vdrm_ccmd_req hdr;
-+
-+   uint64_t size;        /* BO size in bytes                             */
-+   uint32_t placement;   /* memory placement bitmask                     */
-+   uint32_t flags;       /* DRM_XE_GEM_CREATE_FLAG_*                     */
-+   uint32_t vm_id;       /* attached VM id (0 = not attached)            */
-+   uint32_t blob_id;     /* guest-assigned blob id for get_blob()        */
-+   uint16_t cpu_caching; /* DRM_XE_GEM_CPU_CACHING_{WB,WC}              */
-+   uint16_t pad[3];
-+};
-+XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_gem_create_req)
-+
-+/* -------------------------------------------------------------------------
-+ * XE_CCMD_VM_CREATE
-+ * ------------------------------------------------------------------------- */
-+
-+struct xe_ccmd_vm_create_req {
-+   struct vdrm_ccmd_req hdr;
-+
-+   uint32_t flags;   /* DRM_XE_VM_CREATE_FLAG_* */
-+   uint32_t pad;
-+};
-+XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_vm_create_req)
-+
-+struct xe_ccmd_vm_create_rsp {
-+   struct vdrm_ccmd_rsp hdr;
-+
-+   uint32_t pad;
-+   int32_t  ret;
-+   uint32_t vm_id;   /* host-assigned VM id */
-+};
-+XE_STATIC_ASSERT_SIZE(xe_ccmd_vm_create_rsp)
-+
-+/* -------------------------------------------------------------------------
-+ * XE_CCMD_VM_DESTROY
-+ * ------------------------------------------------------------------------- */
-+
-+struct xe_ccmd_vm_destroy_req {
-+   struct vdrm_ccmd_req hdr;
-+
-+   uint32_t vm_id;
-+   uint32_t pad;
-+};
-+XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_vm_destroy_req)
-+
-+/* -------------------------------------------------------------------------
-+ * XE_CCMD_VM_BIND
-+ *
-+ * Each bind operation is serialised inline after the request header.
-+ * The guest uses res_id in place of the GEM handle; the host translates.
-+ * Bind is synchronous: the host processes all ops before returning seqno.
-+ * ------------------------------------------------------------------------- */
-+
-+/**
-+ * struct xe_ccmd_vm_bind_op - one bind/unbind operation (guest wire format).
-+ *
-+ * Mirrors drm_xe_vm_bind_op but replaces @obj (gem handle) with @res_id
-+ * (virgl resource id) so the host can translate.  For UNMAP and UNMAP_ALL
-+ * ops @res_id is zero.
-+ */
-+struct xe_ccmd_vm_bind_op {
-+   uint32_t res_id;      /* virgl res_id → translated to gem handle     */
-+   uint16_t pat_index;
-+   uint16_t pad;
-+   uint64_t obj_offset;  /* offset within BO (or userptr address)       */
-+   uint64_t range;       /* size of the mapping in bytes                 */
-+   uint64_t addr;        /* GPU virtual address                          */
-+   uint32_t op;          /* DRM_XE_VM_BIND_OP_*                         */
-+   uint32_t flags;       /* DRM_XE_VM_BIND_FLAG_*                       */
-+};
-+XE_STATIC_ASSERT_SIZE(xe_ccmd_vm_bind_op)
-+
-+struct xe_ccmd_vm_bind_req {
-+   struct vdrm_ccmd_req hdr;
-+
-+   uint32_t vm_id;
-+   uint32_t num_binds;
-+   uint8_t  payload[];  /* num_binds × xe_ccmd_vm_bind_op               */
-+};
-+XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_vm_bind_req)
-+
-+struct xe_ccmd_vm_bind_rsp {
-+   struct vdrm_ccmd_rsp hdr;
-+
-+   int32_t  ret;
-+};
-+XE_STATIC_ASSERT_SIZE(xe_ccmd_vm_bind_rsp)
-+
-+/* -------------------------------------------------------------------------
-+ * XE_CCMD_EXEC_QUEUE_CREATE
-+ *
-+ * Creates an exec queue.  The payload carries the
-+ * drm_xe_engine_class_instance array (width × num_placements entries).
-+ * The host returns the kernel-assigned exec_queue_id which the guest
-+ * uses verbatim in subsequent EXEC and EXEC_QUEUE_DESTROY commands.
-+ * ------------------------------------------------------------------------- */
-+
-+struct xe_ccmd_exec_queue_create_req {
-+   struct vdrm_ccmd_req hdr;
-+
-+   uint32_t vm_id;
-+   uint16_t width;
-+   uint16_t num_placements;
-+   uint32_t flags;        /* DRM_XE_EXEC_QUEUE_LOW_LATENCY_HINT etc.    */
-+   uint32_t pad;
-+   uint8_t  payload[];    /* width × num_placements drm_xe_engine_class_instance */
-+};
-+XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_exec_queue_create_req)
-+
-+struct xe_ccmd_exec_queue_create_rsp {
-+   struct vdrm_ccmd_rsp hdr;
-+
-+   uint32_t pad;
-+   int32_t  ret;
-+   uint32_t exec_queue_id;  /* host-assigned id; used as ring_idx too   */
-+};
-+XE_STATIC_ASSERT_SIZE(xe_ccmd_exec_queue_create_rsp)
-+
-+/* -------------------------------------------------------------------------
-+ * XE_CCMD_EXEC_QUEUE_DESTROY
-+ * ------------------------------------------------------------------------- */
-+
-+struct xe_ccmd_exec_queue_destroy_req {
-+   struct vdrm_ccmd_req hdr;
-+
-+   uint32_t exec_queue_id;
-+   uint32_t pad;
-+};
-+XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_exec_queue_destroy_req)
-+
-+/* -------------------------------------------------------------------------
-+ * XE_CCMD_EXEC
-+ *
-+ * Submits a batch to the named exec queue.  The host creates an internal
-+ * syncobj, adds it as the out-sync, calls DRM_IOCTL_XE_EXEC, then exports
-+ * the resulting sync-fd into the drm_timeline for fence tracking.
-+ *
-+ * Only num_batch_buffer == 1 is supported for now (address is the GPU VA
-+ * of the single batch buffer).
-+ * ------------------------------------------------------------------------- */
-+
-+struct xe_ccmd_exec_req {
-+   struct vdrm_ccmd_req hdr;
-+
-+   uint32_t exec_queue_id;
-+   uint16_t num_batch_buffer;   /* must be 1 in current implementation  */
-+   uint16_t pad;
-+   uint64_t address;            /* GPU VA of batch buffer               */
-+};
-+XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_exec_req)
-+
-+struct xe_ccmd_exec_rsp {
-+   struct vdrm_ccmd_rsp hdr;
-+
-+   int32_t  ret;
-+};
-+XE_STATIC_ASSERT_SIZE(xe_ccmd_exec_rsp)
-+
-+#ifdef __GNUC__
-+#  pragma GCC diagnostic pop
++#ifdef ENABLE_DRM_XE
++   {
++      .context_type = VIRTGPU_DRM_CONTEXT_XE,
++      .name = "xe",
++      .probe = xe_renderer_probe,
++      .create = xe_renderer_create,
++   },
 +#endif
-+
-+#endif /* XE_VIRTIO_PROTO_H_ */
---- a/src/drm/xe/xe_ccmd.h	2026-04-01 00:29:31.497961298 +0000
-+++ b/src/drm/xe/xe_ccmd.h	2026-03-31 18:37:00.000000000 +0000
-@@ -0,0 +1,19 @@
-+/*
-+ * Copyright 2025 Google LLC
-+ * SPDX-License-Identifier: MIT
-+ */
-+
-+#ifndef XE_RENDERER_CCMD_H_
-+#define XE_RENDERER_CCMD_H_
-+
-+#include "xe_renderer.h"
-+
-+extern const struct drm_ccmd xe_ccmd_dispatch[];
-+extern const unsigned int    xe_ccmd_dispatch_size;
-+
-+/**
-+ * xe_ioctl - thin wrapper around drmIoctl that logs failures.
-+ */
-+int xe_ioctl(int fd, unsigned long cmd, void *arg);
-+
-+#endif /* XE_RENDERER_CCMD_H_ */
---- a/src/drm/xe/xe_ccmd.c	2026-04-01 00:29:31.497961298 +0000
-+++ b/src/drm/xe/xe_ccmd.c	2026-04-01 00:30:01.808897029 +0000
+ };
+ 
+ int
+diff --git a/src/drm/xe/xe_ccmd.c b/src/drm/xe/xe_ccmd.c
+new file mode 100644
+index 00000000..a26eab94
+--- /dev/null
++++ b/src/drm/xe/xe_ccmd.c
 @@ -0,0 +1,467 @@
 +/*
 + * Copyright 2025 Google LLC
@@ -1317,47 +925,36 @@ Signed-off-by: Developer <dev@example.com>
 +};
 +
 +const unsigned int xe_ccmd_dispatch_size = ARRAY_SIZE(xe_ccmd_dispatch);
---- a/src/drm/xe/xe_object.h	2026-04-01 00:29:31.497961298 +0000
-+++ b/src/drm/xe/xe_object.h	2026-03-31 18:36:36.000000000 +0000
-@@ -0,0 +1,36 @@
+diff --git a/src/drm/xe/xe_ccmd.h b/src/drm/xe/xe_ccmd.h
+new file mode 100644
+index 00000000..52a84a87
+--- /dev/null
++++ b/src/drm/xe/xe_ccmd.h
+@@ -0,0 +1,19 @@
 +/*
 + * Copyright 2025 Google LLC
 + * SPDX-License-Identifier: MIT
 + */
 +
-+#ifndef XE_RENDERER_OBJECT_H_
-+#define XE_RENDERER_OBJECT_H_
++#ifndef XE_RENDERER_CCMD_H_
++#define XE_RENDERER_CCMD_H_
 +
 +#include "xe_renderer.h"
 +
++extern const struct drm_ccmd xe_ccmd_dispatch[];
++extern const unsigned int    xe_ccmd_dispatch_size;
++
 +/**
-+ * struct xe_object - host-side wrapper around a Xe GEM buffer object.
-+ *
-+ * Extends drm_object with the CPU caching / map_info needed to tell
-+ * the virtio-gpu blob layer how the guest should map the buffer.
++ * xe_ioctl - thin wrapper around drmIoctl that logs failures.
 + */
-+struct xe_object {
-+   struct drm_object base;
++int xe_ioctl(int fd, unsigned long cmd, void *arg);
 +
-+   /**
-+    * @map_info: VIRGL_RENDERER_MAP_CACHE_* constant derived from the
-+    * cpu_caching field supplied at GEM create time:
-+    *   DRM_XE_GEM_CPU_CACHING_WB → VIRGL_RENDERER_MAP_CACHE_CACHED
-+    *   DRM_XE_GEM_CPU_CACHING_WC → VIRGL_RENDERER_MAP_CACHE_WC
-+    */
-+   int map_info;
-+};
-+DEFINE_CAST(drm_object, xe_object)
-+
-+struct xe_object *xe_object_create(uint32_t handle, uint64_t size,
-+                                   uint16_t cpu_caching);
-+
-+void xe_renderer_free_object(struct drm_context *dctx,
-+                             struct drm_object *dobj);
-+
-+#endif /* XE_RENDERER_OBJECT_H_ */
---- a/src/drm/xe/xe_object.c	2026-04-01 00:29:31.497961298 +0000
-+++ b/src/drm/xe/xe_object.c	2026-03-31 18:36:42.000000000 +0000
++#endif /* XE_RENDERER_CCMD_H_ */
+diff --git a/src/drm/xe/xe_object.c b/src/drm/xe/xe_object.c
+new file mode 100644
+index 00000000..e6bf3d88
+--- /dev/null
++++ b/src/drm/xe/xe_object.c
 @@ -0,0 +1,43 @@
 +/*
 + * Copyright 2025 Google LLC
@@ -1402,35 +999,573 @@ Signed-off-by: Developer <dev@example.com>
 +
 +   free(dobj);
 +}
---- a/src/drm/xe/xe_resource.h	2026-04-01 00:29:31.497961298 +0000
-+++ b/src/drm/xe/xe_resource.h	2026-03-31 18:38:19.000000000 +0000
-@@ -0,0 +1,24 @@
+diff --git a/src/drm/xe/xe_object.h b/src/drm/xe/xe_object.h
+new file mode 100644
+index 00000000..d82e181b
+--- /dev/null
++++ b/src/drm/xe/xe_object.h
+@@ -0,0 +1,36 @@
 +/*
 + * Copyright 2025 Google LLC
 + * SPDX-License-Identifier: MIT
 + */
 +
-+#ifndef XE_RENDERER_RESOURCE_H_
-+#define XE_RENDERER_RESOURCE_H_
++#ifndef XE_RENDERER_OBJECT_H_
++#define XE_RENDERER_OBJECT_H_
 +
 +#include "xe_renderer.h"
 +
-+void xe_renderer_attach_resource(struct virgl_context *vctx,
-+                                 struct virgl_resource *res);
++/**
++ * struct xe_object - host-side wrapper around a Xe GEM buffer object.
++ *
++ * Extends drm_object with the CPU caching / map_info needed to tell
++ * the virtio-gpu blob layer how the guest should map the buffer.
++ */
++struct xe_object {
++   struct drm_object base;
 +
-+enum virgl_resource_fd_type
-+xe_renderer_export_opaque_handle(struct virgl_context *vctx,
-+                                 struct virgl_resource *res,
-+                                 int *out_fd);
++   /**
++    * @map_info: VIRGL_RENDERER_MAP_CACHE_* constant derived from the
++    * cpu_caching field supplied at GEM create time:
++    *   DRM_XE_GEM_CPU_CACHING_WB → VIRGL_RENDERER_MAP_CACHE_CACHED
++    *   DRM_XE_GEM_CPU_CACHING_WC → VIRGL_RENDERER_MAP_CACHE_WC
++    */
++   int map_info;
++};
++DEFINE_CAST(drm_object, xe_object)
 +
-+int xe_renderer_get_blob(struct virgl_context *vctx,
-+                         uint32_t res_id, uint64_t blob_id,
-+                         uint64_t blob_size, uint32_t blob_flags,
-+                         struct virgl_context_blob *blob);
++struct xe_object *xe_object_create(uint32_t handle, uint64_t size,
++                                   uint16_t cpu_caching);
 +
-+#endif /* XE_RENDERER_RESOURCE_H_ */
---- a/src/drm/xe/xe_resource.c	2026-04-01 00:29:31.497961298 +0000
-+++ b/src/drm/xe/xe_resource.c	2026-03-31 18:38:46.000000000 +0000
++void xe_renderer_free_object(struct drm_context *dctx,
++                             struct drm_object *dobj);
++
++#endif /* XE_RENDERER_OBJECT_H_ */
+diff --git a/src/drm/xe/xe_proto.h b/src/drm/xe/xe_proto.h
+new file mode 100644
+index 00000000..89dc7c7a
+--- /dev/null
++++ b/src/drm/xe/xe_proto.h
+@@ -0,0 +1,275 @@
++/*
++ * Copyright 2025 Google LLC
++ * SPDX-License-Identifier: MIT
++ *
++ * xe_proto.h — shared protocol between the guest Mesa Xe virtio driver
++ * and the virglrenderer host-side Xe native context.
++ *
++ * All structs must be:
++ *  - A multiple of 8 bytes in size
++ *  - Aligned to at most 8 bytes
++ * This is enforced by XE_STATIC_ASSERT_SIZE().
++ */
++
++#ifndef XE_VIRTIO_PROTO_H_
++#define XE_VIRTIO_PROTO_H_
++
++
++
++#ifdef __GNUC__
++#  pragma GCC diagnostic push
++#  pragma GCC diagnostic error "-Wpadded"
++#endif
++
++#define XE_STATIC_ASSERT_SIZE(t)                                              \
++   static_assert(sizeof(struct t) % 8 == 0,                                  \
++                 "sizeof(struct " #t ") not multiple of 8");                  \
++   static_assert(alignof(struct t) <= 8,                                      \
++                 "alignof(struct " #t ") too large");
++
++#define XE_DEFINE_CAST(parent, child)                                         \
++   XE_STATIC_ASSERT_SIZE(child)                                               \
++   DEFINE_CAST(parent, child)
++
++/* -------------------------------------------------------------------------
++ * Command opcodes
++ * ------------------------------------------------------------------------- */
++
++enum xe_ccmd {
++   XE_CCMD_NOP              = 0,  /* unused; opcodes start at 1 */
++   XE_CCMD_DEVICE_QUERY     = 1,  /* DRM_IOCTL_XE_DEVICE_QUERY          */
++   XE_CCMD_GEM_CREATE       = 2,  /* DRM_IOCTL_XE_GEM_CREATE             */
++   XE_CCMD_VM_CREATE        = 3,  /* DRM_IOCTL_XE_VM_CREATE              */
++   XE_CCMD_VM_DESTROY       = 4,  /* DRM_IOCTL_XE_VM_DESTROY             */
++   XE_CCMD_VM_BIND          = 5,  /* DRM_IOCTL_XE_VM_BIND                */
++   XE_CCMD_EXEC_QUEUE_CREATE  = 6, /* DRM_IOCTL_XE_EXEC_QUEUE_CREATE     */
++   XE_CCMD_EXEC_QUEUE_DESTROY = 7, /* DRM_IOCTL_XE_EXEC_QUEUE_DESTROY    */
++   XE_CCMD_EXEC             = 8,  /* DRM_IOCTL_XE_EXEC                   */
++};
++
++#define XE_CCMD(_cmd, _len) (struct vdrm_ccmd_req){  \
++      .cmd = XE_CCMD_##_cmd,                          \
++      .len = (_len),                                  \
++   }
++
++/* -------------------------------------------------------------------------
++ * Shmem layout (host → guest shared memory)
++ * ------------------------------------------------------------------------- */
++
++/**
++ * struct xe_shmem - layout of the shmem blob used for host→guest comms.
++ *
++ * Placed at the start of the blob returned by get_blob(blob_id=0).
++ * The response ring starts at offset shmem->base.rsp_mem_offset.
++ */
++struct xe_shmem {
++   struct vdrm_shmem base;
++
++   /**
++    * @error_mask: bitmask of exec_queue_ids that have been banned by
++    * the kernel.  Bit N set means exec_queue_id N is banned.
++    * Updated atomically by the host; polled by the guest.
++    * Limited to the first 64 exec queue ids for simplicity.
++    */
++   uint64_t banned_exec_queue_mask;
++};
++DEFINE_CAST(vdrm_shmem, xe_shmem)
++
++/* -------------------------------------------------------------------------
++ * XE_CCMD_DEVICE_QUERY
++ *
++ * Proxies DRM_IOCTL_XE_DEVICE_QUERY to the host.  Two-phase like the
++ * kernel ioctl: first call with size=0 to get required size, second with
++ * the full size to retrieve data.
++ * ------------------------------------------------------------------------- */
++
++struct xe_ccmd_device_query_req {
++   struct vdrm_ccmd_req hdr;
++
++   uint32_t query;   /* DRM_XE_DEVICE_QUERY_* */
++   uint32_t size;    /* requested payload size (0 = probe) */
++};
++XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_device_query_req)
++
++struct xe_ccmd_device_query_rsp {
++   struct vdrm_ccmd_rsp hdr;
++
++   uint32_t pad;
++   int32_t  ret;      /* errno on failure, 0 on success */
++   uint32_t size;     /* actual payload size written */
++   uint8_t  payload[]; /* query data (variable length, padded to 8B) */
++};
++XE_STATIC_ASSERT_SIZE(xe_ccmd_device_query_rsp)
++
++/* -------------------------------------------------------------------------
++ * XE_CCMD_GEM_CREATE
++ *
++ * Creates a GEM BO on the host and associates it with blob_id so that
++ * get_blob() can later retrieve a virgl resource handle for it.
++ * No response is needed; errors are surfaced through get_blob().
++ * ------------------------------------------------------------------------- */
++
++struct xe_ccmd_gem_create_req {
++   struct vdrm_ccmd_req hdr;
++
++   uint64_t size;        /* BO size in bytes                             */
++   uint32_t placement;   /* memory placement bitmask                     */
++   uint32_t flags;       /* DRM_XE_GEM_CREATE_FLAG_*                     */
++   uint32_t vm_id;       /* attached VM id (0 = not attached)            */
++   uint32_t blob_id;     /* guest-assigned blob id for get_blob()        */
++   uint16_t cpu_caching; /* DRM_XE_GEM_CPU_CACHING_{WB,WC}              */
++   uint16_t pad[3];
++};
++XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_gem_create_req)
++
++/* -------------------------------------------------------------------------
++ * XE_CCMD_VM_CREATE
++ * ------------------------------------------------------------------------- */
++
++struct xe_ccmd_vm_create_req {
++   struct vdrm_ccmd_req hdr;
++
++   uint32_t flags;   /* DRM_XE_VM_CREATE_FLAG_* */
++   uint32_t pad;
++};
++XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_vm_create_req)
++
++struct xe_ccmd_vm_create_rsp {
++   struct vdrm_ccmd_rsp hdr;
++
++   uint32_t pad;
++   int32_t  ret;
++   uint32_t vm_id;   /* host-assigned VM id */
++};
++XE_STATIC_ASSERT_SIZE(xe_ccmd_vm_create_rsp)
++
++/* -------------------------------------------------------------------------
++ * XE_CCMD_VM_DESTROY
++ * ------------------------------------------------------------------------- */
++
++struct xe_ccmd_vm_destroy_req {
++   struct vdrm_ccmd_req hdr;
++
++   uint32_t vm_id;
++   uint32_t pad;
++};
++XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_vm_destroy_req)
++
++/* -------------------------------------------------------------------------
++ * XE_CCMD_VM_BIND
++ *
++ * Each bind operation is serialised inline after the request header.
++ * The guest uses res_id in place of the GEM handle; the host translates.
++ * Bind is synchronous: the host processes all ops before returning seqno.
++ * ------------------------------------------------------------------------- */
++
++/**
++ * struct xe_ccmd_vm_bind_op - one bind/unbind operation (guest wire format).
++ *
++ * Mirrors drm_xe_vm_bind_op but replaces @obj (gem handle) with @res_id
++ * (virgl resource id) so the host can translate.  For UNMAP and UNMAP_ALL
++ * ops @res_id is zero.
++ */
++struct xe_ccmd_vm_bind_op {
++   uint32_t res_id;      /* virgl res_id → translated to gem handle     */
++   uint16_t pat_index;
++   uint16_t pad;
++   uint64_t obj_offset;  /* offset within BO (or userptr address)       */
++   uint64_t range;       /* size of the mapping in bytes                 */
++   uint64_t addr;        /* GPU virtual address                          */
++   uint32_t op;          /* DRM_XE_VM_BIND_OP_*                         */
++   uint32_t flags;       /* DRM_XE_VM_BIND_FLAG_*                       */
++};
++XE_STATIC_ASSERT_SIZE(xe_ccmd_vm_bind_op)
++
++struct xe_ccmd_vm_bind_req {
++   struct vdrm_ccmd_req hdr;
++
++   uint32_t vm_id;
++   uint32_t num_binds;
++   uint8_t  payload[];  /* num_binds × xe_ccmd_vm_bind_op               */
++};
++XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_vm_bind_req)
++
++struct xe_ccmd_vm_bind_rsp {
++   struct vdrm_ccmd_rsp hdr;
++
++   int32_t  ret;
++};
++XE_STATIC_ASSERT_SIZE(xe_ccmd_vm_bind_rsp)
++
++/* -------------------------------------------------------------------------
++ * XE_CCMD_EXEC_QUEUE_CREATE
++ *
++ * Creates an exec queue.  The payload carries the
++ * drm_xe_engine_class_instance array (width × num_placements entries).
++ * The host returns the kernel-assigned exec_queue_id which the guest
++ * uses verbatim in subsequent EXEC and EXEC_QUEUE_DESTROY commands.
++ * ------------------------------------------------------------------------- */
++
++struct xe_ccmd_exec_queue_create_req {
++   struct vdrm_ccmd_req hdr;
++
++   uint32_t vm_id;
++   uint16_t width;
++   uint16_t num_placements;
++   uint32_t flags;        /* DRM_XE_EXEC_QUEUE_LOW_LATENCY_HINT etc.    */
++   uint32_t pad;
++   uint8_t  payload[];    /* width × num_placements drm_xe_engine_class_instance */
++};
++XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_exec_queue_create_req)
++
++struct xe_ccmd_exec_queue_create_rsp {
++   struct vdrm_ccmd_rsp hdr;
++
++   uint32_t pad;
++   int32_t  ret;
++   uint32_t exec_queue_id;  /* host-assigned id; used as ring_idx too   */
++};
++XE_STATIC_ASSERT_SIZE(xe_ccmd_exec_queue_create_rsp)
++
++/* -------------------------------------------------------------------------
++ * XE_CCMD_EXEC_QUEUE_DESTROY
++ * ------------------------------------------------------------------------- */
++
++struct xe_ccmd_exec_queue_destroy_req {
++   struct vdrm_ccmd_req hdr;
++
++   uint32_t exec_queue_id;
++   uint32_t pad;
++};
++XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_exec_queue_destroy_req)
++
++/* -------------------------------------------------------------------------
++ * XE_CCMD_EXEC
++ *
++ * Submits a batch to the named exec queue.  The host creates an internal
++ * syncobj, adds it as the out-sync, calls DRM_IOCTL_XE_EXEC, then exports
++ * the resulting sync-fd into the drm_timeline for fence tracking.
++ *
++ * Only num_batch_buffer == 1 is supported for now (address is the GPU VA
++ * of the single batch buffer).
++ * ------------------------------------------------------------------------- */
++
++struct xe_ccmd_exec_req {
++   struct vdrm_ccmd_req hdr;
++
++   uint32_t exec_queue_id;
++   uint16_t num_batch_buffer;   /* must be 1 in current implementation  */
++   uint16_t pad;
++   uint64_t address;            /* GPU VA of batch buffer               */
++};
++XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_exec_req)
++
++struct xe_ccmd_exec_rsp {
++   struct vdrm_ccmd_rsp hdr;
++
++   int32_t  ret;
++};
++XE_STATIC_ASSERT_SIZE(xe_ccmd_exec_rsp)
++
++#ifdef __GNUC__
++#  pragma GCC diagnostic pop
++#endif
++
++#endif /* XE_VIRTIO_PROTO_H_ */
+diff --git a/src/drm/xe/xe_renderer.c b/src/drm/xe/xe_renderer.c
+new file mode 100644
+index 00000000..d4c00b9c
+--- /dev/null
++++ b/src/drm/xe/xe_renderer.c
+@@ -0,0 +1,143 @@
++/*
++ * Copyright 2025 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#include "virglrenderer.h"
++
++#include "util/hash_table.h"
++
++#include "xe_ccmd.h"
++#include "xe_object.h"
++#include "xe_resource.h"
++#include "xe_renderer.h"
++
++/* -------------------------------------------------------------------------
++ * probe — fill in the capset from the host DRM device
++ * ------------------------------------------------------------------------- */
++
++int
++xe_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
++{
++   drmDevicePtr drmdev = NULL;
++
++   if (drmGetDevice2(fd, DRM_DEVICE_GET_PCI_REVISION, &drmdev)) {
++      drm_dbg("drmGetDevice2 failed: %d", -errno);
++      return -EINVAL;
++   }
++
++   /* Field order matches u.intel so guest can read either member */
++   capset->u.xe.pci_bus         = drmdev->businfo.pci->bus;
++   capset->u.xe.pci_dev         = drmdev->businfo.pci->dev;
++   capset->u.xe.pci_func        = drmdev->businfo.pci->func;
++   capset->u.xe.pci_revision_id = drmdev->deviceinfo.pci->revision_id;
++   capset->u.xe.pci_domain      = drmdev->businfo.pci->domain;
++   capset->u.xe.pci_device_id   = drmdev->deviceinfo.pci->device_id;
++
++   capset->wire_format_version = 1;
++
++   drm_dbg("wire_format_version: %u", capset->wire_format_version);
++   drm_dbg("pci_device_id:       0x%04x", capset->u.xe.pci_device_id);
++   drm_dbg("pci_bus:             %u", capset->u.xe.pci_bus);
++   drm_dbg("pci_dev:             %u", capset->u.xe.pci_dev);
++   drm_dbg("pci_func:            %u", capset->u.xe.pci_func);
++   drm_dbg("pci_domain:          %u", capset->u.xe.pci_domain);
++   drm_dbg("pci_revision_id:     %u", capset->u.xe.pci_revision_id);
++
++   drmFreeDevice(&drmdev);
++   return 0;
++}
++
++/* -------------------------------------------------------------------------
++ * destroy
++ * ------------------------------------------------------------------------- */
++
++static void
++xe_timeline_free_cb(UNUSED const void *key, void *data, UNUSED void *arg)
++{
++   struct drm_timeline *tl = data;
++   drm_timeline_fini(tl);
++   free(tl);
++}
++
++static void
++xe_renderer_destroy(struct virgl_context *vctx)
++{
++   struct drm_context *dctx = to_drm_context(vctx);
++   struct xe_context  *xctx = to_xe_context(dctx);
++
++   /* Drain and free all exec queue timelines. */
++   hash_table_call_foreach(xctx->exec_queue_table,
++                           xe_timeline_free_cb, NULL);
++   _mesa_hash_table_destroy(xctx->exec_queue_table, NULL);
++
++   drm_context_deinit(dctx);
++   free(xctx);
++}
++
++/* -------------------------------------------------------------------------
++ * submit_fence
++ *
++ * Called by the VMM after sending a fence command on a given ring/queue.
++ * queue_id corresponds to the exec_queue_id returned by
++ * XE_CCMD_EXEC_QUEUE_CREATE.
++ * ------------------------------------------------------------------------- */
++
++static int
++xe_renderer_submit_fence(struct virgl_context *vctx,
++                         uint32_t flags,
++                         uint32_t queue_id,
++                         uint64_t fence_id)
++{
++   struct drm_context *dctx = to_drm_context(vctx);
++   struct xe_context  *xctx = to_xe_context(dctx);
++
++   struct drm_timeline *tl =
++      xe_context_get_timeline(xctx, queue_id);
++
++   if (!tl || tl->last_fence_fd < 0) {
++      /* No pending work on this queue — retire the fence immediately. */
++      vctx->fence_retire(vctx, queue_id, fence_id);
++      return 0;
++   }
++
++   return drm_timeline_submit_fence(tl, flags, fence_id);
++}
++
++/* -------------------------------------------------------------------------
++ * create
++ * ------------------------------------------------------------------------- */
++
++struct virgl_context *
++xe_renderer_create(int fd, UNUSED size_t debug_len,
++                   UNUSED const char *debug_name)
++{
++   struct xe_context *xctx = calloc(1, sizeof(*xctx));
++   if (!xctx)
++      return NULL;
++
++   if (!drm_context_init(&xctx->base, fd,
++                         xe_ccmd_dispatch, xe_ccmd_dispatch_size)) {
++      free(xctx);
++      return NULL;
++   }
++
++   xctx->exec_queue_table =
++      _mesa_hash_table_create_u32_keys(NULL);
++   if (!xctx->exec_queue_table) {
++      drm_context_deinit(&xctx->base);
++      free(xctx);
++      return NULL;
++   }
++
++   xctx->base.base.destroy              = xe_renderer_destroy;
++   xctx->base.base.attach_resource      = xe_renderer_attach_resource;
++   xctx->base.base.export_opaque_handle = xe_renderer_export_opaque_handle;
++   xctx->base.base.get_blob             = xe_renderer_get_blob;
++   xctx->base.base.submit_fence         = xe_renderer_submit_fence;
++   xctx->base.base.supports_fence_sharing = true;
++   xctx->base.free_object               = xe_renderer_free_object;
++   xctx->base.ccmd_alignment            = 8;
++
++   return &xctx->base.base;
++}
+diff --git a/src/drm/xe/xe_renderer.h b/src/drm/xe/xe_renderer.h
+new file mode 100644
+index 00000000..19c2b957
+--- /dev/null
++++ b/src/drm/xe/xe_renderer.h
+@@ -0,0 +1,84 @@
++/*
++ * Copyright 2025 Google LLC
++ * SPDX-License-Identifier: MIT
++ */
++
++#ifndef XE_RENDERER_H_
++#define XE_RENDERER_H_
++
++#include "config.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <inttypes.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++#include <sys/mman.h>
++#include <sys/types.h>
++
++#include <xf86drm.h>
++
++#include "virgl_context.h"
++#include "virgl_util.h"
++
++#include "drm_context.h"
++#include "drm_fence.h"
++#include "drm_util.h"
++#include "drm_hw.h"
++
++#include "util/hash_table.h"
++#include "xe_proto.h"
++
++#pragma GCC diagnostic push
++#if !defined(__clang__) && defined(__GNUC__)
++#  pragma GCC diagnostic ignored "-Wpedantic"
++#else
++#  pragma GCC diagnostic ignored "-Wzero-length-array"
++#endif
++#include "drm-uapi/xe_drm.h"
++#pragma GCC diagnostic pop
++
++/**
++ * struct xe_context - per-connection context for the Xe native context.
++ *
++ * Exec queues are created and destroyed dynamically; each one gets its
++ * own drm_timeline.  We use a hash table keyed on the host exec_queue_id
++ * (a small integer assigned by the kernel) to find the right timeline.
++ */
++struct xe_context {
++   struct drm_context base;
++
++   /**
++    * @exec_queue_table: maps (uint32_t exec_queue_id) → (struct drm_timeline *)
++    * Populated by XE_CCMD_EXEC_QUEUE_CREATE, drained on destroy.
++    */
++   struct hash_table *exec_queue_table;
++};
++DEFINE_CAST(drm_context, xe_context)
++
++/* -------------------------------------------------------------------------
++ * Public API
++ * ------------------------------------------------------------------------- */
++
++int xe_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset);
++
++struct virgl_context *xe_renderer_create(int fd, size_t debug_len,
++                                         const char *debug_name);
++
++/* -------------------------------------------------------------------------
++ * Inline helpers
++ * ------------------------------------------------------------------------- */
++
++static inline struct drm_timeline *
++xe_context_get_timeline(struct xe_context *xctx, uint32_t exec_queue_id)
++{
++   const struct hash_entry *e =
++      hash_table_search(xctx->exec_queue_table, exec_queue_id + 1);
++   return e ? e->data : NULL;
++}
++
++#endif /* XE_RENDERER_H_ */
+diff --git a/src/drm/xe/xe_resource.c b/src/drm/xe/xe_resource.c
+new file mode 100644
+index 00000000..7fb39136
+--- /dev/null
++++ b/src/drm/xe/xe_resource.c
 @@ -0,0 +1,171 @@
 +/*
 + * Copyright 2025 Google LLC
@@ -1603,237 +1738,108 @@ Signed-off-by: Developer <dev@example.com>
 +
 +   return 0;
 +}
---- a/src/drm/xe/xe_renderer.h	2026-04-01 00:29:31.497961298 +0000
-+++ b/src/drm/xe/xe_renderer.h	2026-03-31 19:23:22.000000000 +0000
-@@ -0,0 +1,84 @@
+diff --git a/src/drm/xe/xe_resource.h b/src/drm/xe/xe_resource.h
+new file mode 100644
+index 00000000..b3e13766
+--- /dev/null
++++ b/src/drm/xe/xe_resource.h
+@@ -0,0 +1,24 @@
 +/*
 + * Copyright 2025 Google LLC
 + * SPDX-License-Identifier: MIT
 + */
 +
-+#ifndef XE_RENDERER_H_
-+#define XE_RENDERER_H_
++#ifndef XE_RENDERER_RESOURCE_H_
++#define XE_RENDERER_RESOURCE_H_
 +
-+#include "config.h"
-+
-+#include <errno.h>
-+#include <fcntl.h>
-+#include <inttypes.h>
-+#include <stddef.h>
-+#include <stdint.h>
-+#include <stdlib.h>
-+#include <string.h>
-+#include <time.h>
-+#include <unistd.h>
-+#include <sys/mman.h>
-+#include <sys/types.h>
-+
-+#include <xf86drm.h>
-+
-+#include "virgl_context.h"
-+#include "virgl_util.h"
-+
-+#include "drm_context.h"
-+#include "drm_fence.h"
-+#include "drm_util.h"
-+#include "drm_hw.h"
-+
-+#include "util/hash_table.h"
-+#include "xe_proto.h"
-+
-+#pragma GCC diagnostic push
-+#if !defined(__clang__) && defined(__GNUC__)
-+#  pragma GCC diagnostic ignored "-Wpedantic"
-+#else
-+#  pragma GCC diagnostic ignored "-Wzero-length-array"
-+#endif
-+#include "drm-uapi/xe_drm.h"
-+#pragma GCC diagnostic pop
-+
-+/**
-+ * struct xe_context - per-connection context for the Xe native context.
-+ *
-+ * Exec queues are created and destroyed dynamically; each one gets its
-+ * own drm_timeline.  We use a hash table keyed on the host exec_queue_id
-+ * (a small integer assigned by the kernel) to find the right timeline.
-+ */
-+struct xe_context {
-+   struct drm_context base;
-+
-+   /**
-+    * @exec_queue_table: maps (uint32_t exec_queue_id) → (struct drm_timeline *)
-+    * Populated by XE_CCMD_EXEC_QUEUE_CREATE, drained on destroy.
-+    */
-+   struct hash_table *exec_queue_table;
-+};
-+DEFINE_CAST(drm_context, xe_context)
-+
-+/* -------------------------------------------------------------------------
-+ * Public API
-+ * ------------------------------------------------------------------------- */
-+
-+int xe_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset);
-+
-+struct virgl_context *xe_renderer_create(int fd, size_t debug_len,
-+                                         const char *debug_name);
-+
-+/* -------------------------------------------------------------------------
-+ * Inline helpers
-+ * ------------------------------------------------------------------------- */
-+
-+static inline struct drm_timeline *
-+xe_context_get_timeline(struct xe_context *xctx, uint32_t exec_queue_id)
-+{
-+   /* hash_table_search() treats key==0 as invalid, so offset by 1 */
-+   const struct hash_entry *e =
-+      hash_table_search(xctx->exec_queue_table, exec_queue_id + 1);
-+   return e ? e->data : NULL;
-+}
-+
-+#endif /* XE_RENDERER_H_ */
---- a/src/drm/xe/xe_renderer.c	2026-04-01 00:29:31.497961298 +0000
-+++ b/src/drm/xe/xe_renderer.c	2026-03-31 21:22:08.000000000 +0000
-@@ -0,0 +1,143 @@
-+/*
-+ * Copyright 2025 Google LLC
-+ * SPDX-License-Identifier: MIT
-+ */
-+
-+#include "virglrenderer.h"
-+
-+#include "util/hash_table.h"
-+
-+#include "xe_ccmd.h"
-+#include "xe_object.h"
-+#include "xe_resource.h"
 +#include "xe_renderer.h"
 +
-+/* -------------------------------------------------------------------------
-+ * probe — fill in the capset from the host DRM device
-+ * ------------------------------------------------------------------------- */
++void xe_renderer_attach_resource(struct virgl_context *vctx,
++                                 struct virgl_resource *res);
 +
-+int
-+xe_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset)
-+{
-+   drmDevicePtr drmdev = NULL;
++enum virgl_resource_fd_type
++xe_renderer_export_opaque_handle(struct virgl_context *vctx,
++                                 struct virgl_resource *res,
++                                 int *out_fd);
 +
-+   if (drmGetDevice2(fd, DRM_DEVICE_GET_PCI_REVISION, &drmdev)) {
-+      drm_dbg("drmGetDevice2 failed: %d", -errno);
-+      return -EINVAL;
-+   }
++int xe_renderer_get_blob(struct virgl_context *vctx,
++                         uint32_t res_id, uint64_t blob_id,
++                         uint64_t blob_size, uint32_t blob_flags,
++                         struct virgl_context_blob *blob);
 +
-+   /* Field order matches u.intel so guest can read either member */
-+   capset->u.xe.pci_bus         = drmdev->businfo.pci->bus;
-+   capset->u.xe.pci_dev         = drmdev->businfo.pci->dev;
-+   capset->u.xe.pci_func        = drmdev->businfo.pci->func;
-+   capset->u.xe.pci_revision_id = drmdev->deviceinfo.pci->revision_id;
-+   capset->u.xe.pci_domain      = drmdev->businfo.pci->domain;
-+   capset->u.xe.pci_device_id   = drmdev->deviceinfo.pci->device_id;
++#endif /* XE_RENDERER_RESOURCE_H_ */
+diff --git a/src/drm_hw.h b/src/drm_hw.h
+index 549f2ee2..a3a72f89 100644
+--- a/src/drm_hw.h
++++ b/src/drm_hw.h
+@@ -33,6 +33,7 @@ struct virgl_renderer_capset_drm {
+ #define VIRTGPU_DRM_CONTEXT_I915     3
+ #define VIRTGPU_DRM_CONTEXT_ASAHI    4
+ #define VIRTGPU_DRM_CONTEXT_PANFROST 5
++#define VIRTGPU_DRM_CONTEXT_XE       6
+    uint32_t context_type;
+    uint32_t pad;
+    union {
+@@ -71,6 +72,14 @@ struct virgl_renderer_capset_drm {
+          uint32_t pci_domain;
+          uint32_t pci_device_id;
+       } intel;  /* context_type == VIRTGPU_DRM_CONTEXT_I915 */
++      struct {
++         uint32_t pci_bus;
++         uint32_t pci_dev;
++         uint32_t pci_func;
++         uint32_t pci_revision_id;
++         uint32_t pci_domain;
++         uint32_t pci_device_id;
++      } xe;     /* context_type == VIRTGPU_DRM_CONTEXT_XE */
+    } u;
+ };
+ 
+diff --git a/src/meson.build b/src/meson.build
+index ed677f38..e5f7af20 100644
+--- a/src/meson.build
++++ b/src/meson.build
+@@ -145,6 +145,19 @@ drm_i915_sources = [
+    'drm/i915/i915_renderer.h',
+ ]
+ 
++drm_xe_sources = [
++   'drm/drm-uapi/xe_drm.h',
++   'drm/xe/xe_proto.h',
++   'drm/xe/xe_ccmd.c',
++   'drm/xe/xe_ccmd.h',
++   'drm/xe/xe_object.c',
++   'drm/xe/xe_object.h',
++   'drm/xe/xe_resource.c',
++   'drm/xe/xe_resource.h',
++   'drm/xe/xe_renderer.c',
++   'drm/xe/xe_renderer.h',
++]
 +
-+   capset->wire_format_version = 1;
+ proxy_sources = [
+    'proxy/proxy_client.c',
+    'proxy/proxy_common.c',
+@@ -227,6 +240,10 @@ if with_drm_i915
+    virgl_sources += drm_i915_sources
+ endif
+ 
++if with_drm_xe
++   virgl_sources += drm_xe_sources
++endif
 +
-+   drm_dbg("wire_format_version: %u", capset->wire_format_version);
-+   drm_dbg("pci_device_id:       0x%04x", capset->u.xe.pci_device_id);
-+   drm_dbg("pci_bus:             %u", capset->u.xe.pci_bus);
-+   drm_dbg("pci_dev:             %u", capset->u.xe.pci_dev);
-+   drm_dbg("pci_func:            %u", capset->u.xe.pci_func);
-+   drm_dbg("pci_domain:          %u", capset->u.xe.pci_domain);
-+   drm_dbg("pci_revision_id:     %u", capset->u.xe.pci_revision_id);
-+
-+   drmFreeDevice(&drmdev);
-+   return 0;
-+}
-+
-+/* -------------------------------------------------------------------------
-+ * destroy
-+ * ------------------------------------------------------------------------- */
-+
-+static void
-+xe_timeline_free_cb(UNUSED const void *key, void *data, UNUSED void *arg)
-+{
-+   struct drm_timeline *tl = data;
-+   drm_timeline_fini(tl);
-+   free(tl);
-+}
-+
-+static void
-+xe_renderer_destroy(struct virgl_context *vctx)
-+{
-+   struct drm_context *dctx = to_drm_context(vctx);
-+   struct xe_context  *xctx = to_xe_context(dctx);
-+
-+   /* Drain and free all exec queue timelines. */
-+   hash_table_call_foreach(xctx->exec_queue_table,
-+                           xe_timeline_free_cb, NULL);
-+   _mesa_hash_table_destroy(xctx->exec_queue_table, NULL);
-+
-+   drm_context_deinit(dctx);
-+   free(xctx);
-+}
-+
-+/* -------------------------------------------------------------------------
-+ * submit_fence
-+ *
-+ * Called by the VMM after sending a fence command on a given ring/queue.
-+ * queue_id corresponds to the exec_queue_id returned by
-+ * XE_CCMD_EXEC_QUEUE_CREATE.
-+ * ------------------------------------------------------------------------- */
-+
-+static int
-+xe_renderer_submit_fence(struct virgl_context *vctx,
-+                         uint32_t flags,
-+                         uint32_t queue_id,
-+                         uint64_t fence_id)
-+{
-+   struct drm_context *dctx = to_drm_context(vctx);
-+   struct xe_context  *xctx = to_xe_context(dctx);
-+
-+   struct drm_timeline *tl =
-+      xe_context_get_timeline(xctx, queue_id);
-+
-+   if (!tl || tl->last_fence_fd < 0) {
-+      /* No pending work on this queue — retire the fence immediately. */
-+      vctx->fence_retire(vctx, queue_id, fence_id);
-+      return 0;
-+   }
-+
-+   return drm_timeline_submit_fence(tl, flags, fence_id);
-+}
-+
-+/* -------------------------------------------------------------------------
-+ * create
-+ * ------------------------------------------------------------------------- */
-+
-+struct virgl_context *
-+xe_renderer_create(int fd, UNUSED size_t debug_len,
-+                   UNUSED const char *debug_name)
-+{
-+   struct xe_context *xctx = calloc(1, sizeof(*xctx));
-+   if (!xctx)
-+      return NULL;
-+
-+   if (!drm_context_init(&xctx->base, fd,
-+                         xe_ccmd_dispatch, xe_ccmd_dispatch_size)) {
-+      free(xctx);
-+      return NULL;
-+   }
-+
-+   xctx->exec_queue_table =
-+      _mesa_hash_table_create_u32_keys(NULL);
-+   if (!xctx->exec_queue_table) {
-+      drm_context_deinit(&xctx->base);
-+      free(xctx);
-+      return NULL;
-+   }
-+
-+   xctx->base.base.destroy              = xe_renderer_destroy;
-+   xctx->base.base.attach_resource      = xe_renderer_attach_resource;
-+   xctx->base.base.export_opaque_handle = xe_renderer_export_opaque_handle;
-+   xctx->base.base.get_blob             = xe_renderer_get_blob;
-+   xctx->base.base.submit_fence         = xe_renderer_submit_fence;
-+   xctx->base.base.supports_fence_sharing = true;
-+   xctx->base.free_object               = xe_renderer_free_object;
-+   xctx->base.ccmd_alignment            = 8;
-+
-+   return &xctx->base.base;
-+}
+ if with_render_server
+    virgl_sources += proxy_sources
+ endif
+diff --git a/src/virglrenderer.c b/src/virglrenderer.c
+index 79717fcc..88cd456c 100644
+--- a/src/virglrenderer.c
++++ b/src/virglrenderer.c
+@@ -573,7 +573,7 @@ void virgl_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
+       *max_size = proxy_get_capset(cap_set, NULL);
+       break;
+    case VIRTGPU_DRM_CAPSET_DRM:
+-      *max_ver = 0;
++      *max_ver = 1;
+       *max_size = drm_renderer_capset(NULL);
+       break;
+    default:
