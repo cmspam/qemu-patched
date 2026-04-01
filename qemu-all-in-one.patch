@@ -130,7 +130,7 @@ index 98feaa58b..b419983c0 100644
  
  /* in ms */
 -#define GUI_REFRESH_INTERVAL_DEFAULT    30
-+#define GUI_REFRESH_INTERVAL_DEFAULT    1
++#define GUI_REFRESH_INTERVAL_DEFAULT    20
  #define GUI_REFRESH_INTERVAL_IDLE     3000
  
  /* Color number is match to standard vga palette */
