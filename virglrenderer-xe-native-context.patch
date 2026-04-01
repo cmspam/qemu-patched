@@ -79,10 +79,10 @@ index 3eb33e9b5d684711a6c7aad880f7fdb6743c8925..0b81a18368191ac2087ad4e9fca06297
  int
 diff --git a/src/drm/xe/xe_ccmd.c b/src/drm/xe/xe_ccmd.c
 new file mode 100644
-index 0000000000000000000000000000000000000000..d75b807fdaf5f63c4e8fa3b1e13095ff4cb4d89f
+index 0000000000000000000000000000000000000000..3c1b3446f7ed73219a238287354419b22c0366ea
 --- /dev/null
 +++ b/src/drm/xe/xe_ccmd.c
-@@ -0,0 +1,374 @@
+@@ -0,0 +1,410 @@
 +/*
 + * Copyright 2025 Google LLC
 + * SPDX-License-Identifier: MIT
@@ -187,8 +187,10 @@ index 0000000000000000000000000000000000000000..d75b807fdaf5f63c4e8fa3b1e13095ff
 +   size_t expected_len = size_add(sizeof(*req), ops_sz);
 +   const struct xe_ccmd_vm_bind_op *guest_ops;
 +   struct drm_xe_vm_bind_op *host_ops;
++   struct drm_xe_sync sync;
 +   struct xe_ccmd_vm_bind_rsp *rsp;
 +   struct drm_xe_vm_bind args;
++   uint32_t bind_syncobj = 0;
 +
 +   if (hdr->len != expected_len) {
 +      drm_err("bad len: %u vs %zu", hdr->len, expected_len);
@@ -242,12 +244,46 @@ index 0000000000000000000000000000000000000000..d75b807fdaf5f63c4e8fa3b1e13095ff
 +   memset(&args, 0, sizeof(args));
 +   args.vm_id = req->vm_id;
 +   args.num_binds = req->num_binds;
++   args.exec_queue_id = 0;
 +   if (req->num_binds == 1)
 +      args.bind = host_ops[0];
 +   else
 +      args.vector_of_binds = (uintptr_t)host_ops;
 +
++   {
++      struct drm_syncobj_create sc = { .flags = 0 };
++      if (drmIoctl(dctx->fd, DRM_IOCTL_SYNCOBJ_CREATE, &sc)) {
++         rsp->ret = errno;
++         free(host_ops);
++         return 0;
++      }
++      bind_syncobj = sc.handle;
++   }
++
++   memset(&sync, 0, sizeof(sync));
++   sync.type = DRM_XE_SYNC_TYPE_SYNCOBJ;
++   sync.flags = DRM_XE_SYNC_FLAG_SIGNAL;
++   sync.handle = bind_syncobj;
++   args.num_syncs = 1;
++   args.syncs = (uintptr_t)&sync;
++
 +   rsp->ret = drmIoctl(dctx->fd, DRM_IOCTL_XE_VM_BIND, &args) ? errno : 0;
++   if (!rsp->ret) {
++      struct drm_syncobj_wait wait = {
++         .handles = (uintptr_t)&bind_syncobj,
++         .count_handles = 1,
++         .timeout_nsec = INT64_MAX,
++         .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
++      };
++
++      if (drmIoctl(dctx->fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait))
++         rsp->ret = errno;
++   }
++
++   if (bind_syncobj) {
++      struct drm_syncobj_destroy sd = { .handle = bind_syncobj };
++      drmIoctl(dctx->fd, DRM_IOCTL_SYNCOBJ_DESTROY, &sd);
++   }
 +   free(host_ops);
 +   return 0;
 +}
