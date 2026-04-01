@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
 From: Developer <dev@example.com>
-Date: Wed, 01 Apr 2026 00:46:09 +0000
+Date: Wed, 01 Apr 2026 00:48:21 +0000
 Subject: [PATCH 1/1] drm/xe: add Xe native context for virglrenderer
 
 Implements the host-side virglrenderer native context for the Intel Xe
@@ -112,7 +112,15 @@ Signed-off-by: Developer <dev@example.com>
  endif
 --- a/src/drm_hw.h
 +++ b/src/drm_hw.h
-@@ -71,6 +71,14 @@
+@@ -33,6 +33,7 @@
+ #define VIRTGPU_DRM_CONTEXT_I915     3
+ #define VIRTGPU_DRM_CONTEXT_ASAHI    4
+ #define VIRTGPU_DRM_CONTEXT_PANFROST 5
++#define VIRTGPU_DRM_CONTEXT_XE       6
+    uint32_t context_type;
+    uint32_t pad;
+    union {
+@@ -71,6 +72,14 @@
           uint32_t pci_domain;
           uint32_t pci_device_id;
        } intel;  /* context_type == VIRTGPU_DRM_CONTEXT_I915 */
