@@ -555,10 +555,10 @@ index 0000000000000000000000000000000000000000..6ddcd88f6d805e226236cc8c051428d8
 +#endif /* XE_RENDERER_OBJECT_H_ */
 diff --git a/src/drm/xe/xe_proto.h b/src/drm/xe/xe_proto.h
 new file mode 100644
-index 0000000000000000000000000000000000000000..223df16129242ac8ab6bd4c7556120c64017397e
+index 0000000000000000000000000000000000000000..45faa041f774f2aca90d9fc4fd95e3e4b4bd9ac0
 --- /dev/null
 +++ b/src/drm/xe/xe_proto.h
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,170 @@
 +/*
 + * Copyright 2025 Google LLC
 + * SPDX-License-Identifier: MIT
@@ -677,16 +677,18 @@ index 0000000000000000000000000000000000000000..223df16129242ac8ab6bd4c7556120c6
 +
 +struct xe_ccmd_vm_bind_rsp {
 +   struct vdrm_ccmd_rsp hdr;
++   uint32_t pad;
 +   int32_t ret;
++   uint32_t pad2;
 +};
 +XE_STATIC_ASSERT_SIZE(xe_ccmd_vm_bind_rsp)
 +
 +struct xe_ccmd_exec_queue_create_req {
 +   struct vdrm_ccmd_req hdr;
 +   uint32_t vm_id;
++   uint32_t flags;
 +   uint16_t width;
 +   uint16_t num_placements;
-+   uint32_t flags;
 +   uint32_t pad;
 +   uint8_t payload[];
 +};
