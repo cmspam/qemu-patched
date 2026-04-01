@@ -1147,7 +1147,7 @@ Signed-off-by: Developer <dev@example.com>
 +                     create.exec_queue_id, drm_context_fence_retire);
 +
 +   _mesa_hash_table_insert(xctx->exec_queue_table,
-+                           (void *)(uintptr_t)create.exec_queue_id, tl);
++                           (void *)(uintptr_t)(create.exec_queue_id + 1), tl);
 +
 +   return 0;
 +}
@@ -1166,7 +1166,7 @@ Signed-off-by: Developer <dev@example.com>
 +   /* Tear down the timeline before destroying the kernel queue so that any
 +    * in-flight fence wait threads can drain cleanly. */
 +   struct hash_entry *entry =
-+      hash_table_search(xctx->exec_queue_table, req->exec_queue_id);
++      hash_table_search(xctx->exec_queue_table, req->exec_queue_id + 1);
 +   if (entry) {
 +      struct drm_timeline *tl = entry->data;
 +      drm_timeline_fini(tl);
@@ -1684,8 +1684,9 @@ Signed-off-by: Developer <dev@example.com>
 +static inline struct drm_timeline *
 +xe_context_get_timeline(struct xe_context *xctx, uint32_t exec_queue_id)
 +{
++   /* hash_table_search() treats key==0 as invalid, so offset by 1 */
 +   const struct hash_entry *e =
-+      hash_table_search(xctx->exec_queue_table, exec_queue_id);
++      hash_table_search(xctx->exec_queue_table, exec_queue_id + 1);
 +   return e ? e->data : NULL;
 +}
 +
