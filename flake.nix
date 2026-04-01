@@ -1,5 +1,5 @@
 {
-  description = "QEMU from git master with virglrenderer from git, PAT patch, and full graphics support";
+  description = "QEMU from git master with a decoupled custom virglrenderer";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs/nixos-unstable";
@@ -35,32 +35,26 @@
     {
       overlays.default = final: prev: {
 
-        # virglrenderer built from git HEAD with MR!1268:
-        # "vrend: support linear gbm_bo blob resources for dGPU prime"
-        # This is the host-side counterpart to mesa MR!23896 -- without it,
-        # the guest can request a linear GBM-backed blob resource but the host
-        # virglrenderer won't create one, causing dmabuf import to fail.
+        # 1. Build your custom virglrenderer separately
         virglrenderer = prev.virglrenderer.overrideAttrs (oldAttrs: {
-          version = "git-${virglrenderer-src.shortRev or virglrenderer-src.rev}";
+          version = "git-${virglrenderer-src.shortRev or "dirty"}";
           src = virglrenderer-src;
 
           patches = (oldAttrs.patches or [ ]) ++ [
             ./virglrenderer-xe-native-context.patch
           ];
 
-          # GBM allocation must be enabled for the patch to activate --
-          # the key code paths are gated on ENABLE_GBM_ALLOCATION
           mesonFlags = (oldAttrs.mesonFlags or [ ]) ++ [
             "-Ddrm-renderers=xe-experimental"
           ];
         });
 
-        # QEMU built from git HEAD, using our git virglrenderer, with full graphics stack
-        qemu = (prev.qemu.override {
-          # Use our git virglrenderer
-          virglrenderer    = final.virglrenderer;
+        # 2. Build QEMU using the virglrenderer defined above
+        qemu-custom = (prev.qemu.override {
+          # This forces QEMU to use the custom package from this overlay
+          virglrenderer = final.virglrenderer;
 
-          # Graphics / display
+          # Full graphics/audio stack
           virglSupport     = true;
           openGLSupport    = true;
           sdlSupport       = true;
@@ -68,13 +62,9 @@
           vncSupport       = true;
           spiceSupport     = true;
           usbredirSupport  = true;
-
-          # Audio
           pulseSupport     = true;
           pipewireSupport  = true;
           alsaSupport      = true;
-
-          # System / misc
           numaSupport      = true;
           seccompSupport   = true;
           smartcardSupport = true;
@@ -95,16 +85,12 @@
           preConfigure = ''
             touch .git
             mkdir -p subprojects
-
             cp -a ${inputs.keycodemapdb} subprojects/keycodemapdb
             cp -a ${inputs.berkeley-softfloat-3} subprojects/berkeley-softfloat-3
             cp -a ${inputs.berkeley-testfloat-3} subprojects/berkeley-testfloat-3
             chmod -R +w subprojects/
-
             cp -r subprojects/packagefiles/berkeley-softfloat-3/* subprojects/berkeley-softfloat-3/
             cp -r subprojects/packagefiles/berkeley-testfloat-3/* subprojects/berkeley-testfloat-3/
-
-            rm -rf build/meson-private
           '';
 
           nativeBuildInputs = (oldAttrs.nativeBuildInputs or [ ]) ++ [
@@ -133,8 +119,9 @@
           };
         in
         {
-          default       = pkgs.qemu;
-          qemu          = pkgs.qemu;
+          # Now you can build either one independently
+          default = pkgs.qemu-custom;
+          qemu = pkgs.qemu-custom;
           virglrenderer = pkgs.virglrenderer;
         });
 
@@ -147,9 +134,11 @@
         in
         {
           default = pkgs.mkShell {
-            buildInputs = [ pkgs.qemu pkgs.virglrenderer ];
+            # Use 'inputsFrom' to get all build deps for virglrenderer 
+            # if you want to develop inside the shell.
+            inputsFrom = [ pkgs.virglrenderer ];
+            buildInputs = [ pkgs.qemu-custom pkgs.virglrenderer ];
           };
         });
     };
 }
-
