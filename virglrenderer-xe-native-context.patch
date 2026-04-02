@@ -1,4 +1,4 @@
-From 79aab6025c0ed1f9523d794fd4094426f081a7da Mon Sep 17 00:00:00 2001
+From 82c56c3e47050972ecaab4a24d7993b70f6c0e86 Mon Sep 17 00:00:00 2001
 From: cmspam <cmspam>
 Date: Fri, 3 Apr 2026 02:40:46 +0900
 Subject: [PATCH] drm: add xe native-context renderer backend
@@ -2645,7 +2645,7 @@ index 3eb33e9b..fa4e4d68 100644
           continue;
 diff --git a/src/drm/xe/xe_ccmd.c b/src/drm/xe/xe_ccmd.c
 new file mode 100644
-index 00000000..8d4117eb
+index 00000000..41b77c63
 --- /dev/null
 +++ b/src/drm/xe/xe_ccmd.c
 @@ -0,0 +1,506 @@
@@ -2845,7 +2845,7 @@ index 00000000..8d4117eb
 +   uint64_t ext_off = req->extensions;
 +
 +   if (req->ext_size) {
-+      if (!ext_off || ext_off < instances_size || ext_off >= instances_size + req->ext_size) {
++      if (ext_off < instances_size || ext_off >= instances_size + req->ext_size) {
 +         drm_err("invalid extension chain start: %" PRIu64, req->extensions);
 +         return -EINVAL;
 +      }
