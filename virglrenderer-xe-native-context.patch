@@ -1,4 +1,4 @@
-From 32cf98bbd8d99c7a26578f2e62942c9f897e0bba Mon Sep 17 00:00:00 2001
+From b49b922231113e6136eb24ece7006a67f5c09065 Mon Sep 17 00:00:00 2001
 From: cmspam <cmspam>
 Date: Fri, 3 Apr 2026 00:53:08 +0900
 Subject: [PATCH] drm: add Intel Xe native context backend
@@ -40,14 +40,14 @@ Signed-off-by: Charles Miller <charlesmiller@charlesmiller.dev>
  src/drm/xe/xe_ccmd.h      |   16 +
  src/drm/xe/xe_object.c    |   35 +
  src/drm/xe/xe_object.h    |   23 +
- src/drm/xe/xe_proto.h     |  242 ++++
+ src/drm/xe/xe_proto.h     |  211 ++++
  src/drm/xe/xe_renderer.c  |  126 ++
  src/drm/xe/xe_renderer.h  |   60 +
  src/drm/xe/xe_resource.c  |  160 +++
  src/drm/xe/xe_resource.h  |   22 +
  src/drm_hw.h              |    9 +
  src/meson.build           |   17 +
- 16 files changed, 3635 insertions(+)
+ 16 files changed, 3604 insertions(+)
  create mode 100644 src/drm/drm-uapi/xe_drm.h
  create mode 100644 src/drm/xe/xe_ccmd.c
  create mode 100644 src/drm/xe/xe_ccmd.h
@@ -3148,10 +3148,10 @@ index 0000000..6643a82
 +#endif /* XE_RENDERER_OBJECT_H_ */
 diff --git a/src/drm/xe/xe_proto.h b/src/drm/xe/xe_proto.h
 new file mode 100644
-index 0000000..4767d79
+index 0000000..a8bf611
 --- /dev/null
 +++ b/src/drm/xe/xe_proto.h
-@@ -0,0 +1,242 @@
+@@ -0,0 +1,211 @@
 +/*
 + * Copyright 2025 Intel Corporation
 + * SPDX-License-Identifier: MIT
@@ -3159,8 +3159,6 @@ index 0000000..4767d79
 +
 +#ifndef XE_VIRTIO_PROTO_H_
 +#define XE_VIRTIO_PROTO_H_
-+
-+#include "drm_hw.h"
 +
 +#ifdef __GNUC__
 +# pragma GCC diagnostic push
@@ -3172,12 +3170,11 @@ index 0000000..4767d79
 +   static_assert(alignof(struct t) <= 8, "alignof(struct " #t ") too large");
 +
 +#define XE_DEFINE_CAST(parent, child)                                          \
-+   XE_STATIC_ASSERT_SIZE(child)                                               \
++   XE_STATIC_ASSERT_SIZE(child)                                                \
 +   DEFINE_CAST(parent, child)                                                  \
 +
 +enum xe_ccmd {
-+   XE_CCMD_NOP = 0,
-+   XE_CCMD_DEVICE_QUERY,
++   XE_CCMD_DEVICE_QUERY = 1,
 +   XE_CCMD_GEM_CREATE,
 +   XE_CCMD_VM_CREATE,
 +   XE_CCMD_VM_DESTROY,
@@ -3188,8 +3185,8 @@ index 0000000..4767d79
 +};
 +
 +#define XE_CCMD(_cmd, _len) (struct vdrm_ccmd_req){      \
-+       .cmd = XE_CCMD_##_cmd,                            \
-+       .len = (_len),                                    \
++       .cmd = XE_CCMD_##_cmd,                             \
++       .len = (_len),                                     \
 +   }
 +
 +/**
@@ -3207,9 +3204,6 @@ index 0000000..4767d79
 +
 +/*
 + * XE_CCMD_DEVICE_QUERY
-+ *
-+ * Tunnels drm_xe_device_query.  Replaces the i915 GETPARAM/QUERYPARAM
-+ * pair with Xe's unified query interface.
 + */
 +struct xe_ccmd_device_query_req {
 +   struct vdrm_ccmd_req hdr;
@@ -3231,29 +3225,22 @@ index 0000000..4767d79
 +
 +/*
 + * XE_CCMD_GEM_CREATE
-+ *
-+ * Tunnels drm_xe_gem_create.  The host translates blob_id into the
-+ * virtio-gpu resource that backs this BO.
 + */
 +struct xe_ccmd_gem_create_req {
 +   struct vdrm_ccmd_req hdr;
 +
 +   uint64_t size;
++   uint32_t blob_id;
 +   uint32_t placement;
 +   uint32_t flags;
 +   uint32_t vm_id;
 +   uint16_t cpu_caching;
-+   uint16_t pad;
-+   uint32_t blob_id;
-+   uint32_t pad2;
++   uint16_t pad[3];
 +};
 +XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_gem_create_req)
 +
 +/*
 + * XE_CCMD_VM_CREATE
-+ *
-+ * Tunnels drm_xe_vm_create.  The host allocates a VM on the native
-+ * Xe device and returns the vm_id.
 + */
 +struct xe_ccmd_vm_create_req {
 +   struct vdrm_ccmd_req hdr;
@@ -3274,8 +3261,6 @@ index 0000000..4767d79
 +
 +/*
 + * XE_CCMD_VM_DESTROY
-+ *
-+ * Tunnels drm_xe_vm_destroy.
 + */
 +struct xe_ccmd_vm_destroy_req {
 +   struct vdrm_ccmd_req hdr;
@@ -3287,17 +3272,9 @@ index 0000000..4767d79
 +
 +/*
 + * XE_CCMD_VM_BIND
-+ *
-+ * Tunnels drm_xe_vm_bind with a variable number of bind operations
-+ * serialized into the payload as xe_ccmd_vm_bind_op structs.
-+ */
-+
-+/**
-+ * A single bind operation within a VM_BIND command.  Uses res_id
-+ * (virtio-gpu resource ID) instead of the kernel's GEM obj handle.
 + */
 +struct xe_ccmd_vm_bind_op {
-+   uint32_t res_id;
++   uint32_t obj;
 +   uint16_t pat_index;
 +   uint16_t pad;
 +   uint64_t obj_offset;
@@ -3308,7 +3285,6 @@ index 0000000..4767d79
 +   uint32_t prefetch_mem_region_instance;
 +   uint32_t pad2;
 +};
-+XE_STATIC_ASSERT_SIZE(xe_ccmd_vm_bind_op)
 +
 +struct xe_ccmd_vm_bind_req {
 +   struct vdrm_ccmd_req hdr;
@@ -3316,37 +3292,28 @@ index 0000000..4767d79
 +   uint32_t vm_id;
 +   uint32_t exec_queue_id;
 +   uint32_t num_binds;
-+   uint32_t pad;
-+
-+   /**
-+    * Variable-length array of xe_ccmd_vm_bind_op, one per bind operation.
-+    */
++   uint32_t num_syncs;
 +   uint8_t payload[];
 +};
 +XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_vm_bind_req)
 +
++struct xe_ccmd_vm_bind_rsp {
++   struct vdrm_ccmd_rsp hdr;
++   int32_t ret;
++};
++XE_STATIC_ASSERT_SIZE(xe_ccmd_vm_bind_rsp)
++
 +/*
 + * XE_CCMD_EXEC_QUEUE_CREATE
-+ *
-+ * Tunnels drm_xe_exec_queue_create.  The engine class instances are
-+ * serialized into the payload as drm_xe_engine_class_instance structs.
-+ *
-+ * Field order: hdr, vm_id, flags, width, num_placements, pad, payload[]
-+ * This order must match the virglrenderer host-side decoder.
 + */
 +struct xe_ccmd_exec_queue_create_req {
 +   struct vdrm_ccmd_req hdr;
 +
-+   uint32_t vm_id;
-+   uint32_t flags;
 +   uint16_t width;
 +   uint16_t num_placements;
++   uint32_t vm_id;
++   uint32_t flags;
 +   uint32_t pad;
-+
-+   /**
-+    * Variable-length array of drm_xe_engine_class_instance, sized by
-+    * width * num_placements.
-+    */
 +   uint8_t payload[];
 +};
 +XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_exec_queue_create_req)
@@ -3362,8 +3329,6 @@ index 0000000..4767d79
 +
 +/*
 + * XE_CCMD_EXEC_QUEUE_DESTROY
-+ *
-+ * Tunnels drm_xe_exec_queue_destroy.
 + */
 +struct xe_ccmd_exec_queue_destroy_req {
 +   struct vdrm_ccmd_req hdr;
@@ -3375,19 +3340,23 @@ index 0000000..4767d79
 +
 +/*
 + * XE_CCMD_EXEC
-+ *
-+ * Tunnels drm_xe_exec.  Syncs are handled by the virtio-gpu fence
-+ * mechanism, so they are not included here.
 + */
 +struct xe_ccmd_exec_req {
 +   struct vdrm_ccmd_req hdr;
 +
 +   uint32_t exec_queue_id;
-+   uint16_t num_batch_buffer;
-+   uint16_t pad;
++   uint32_t num_syncs;
 +   uint64_t address;
++   uint16_t num_batch_buffer;
++   uint16_t pad[3];
 +};
 +XE_DEFINE_CAST(vdrm_ccmd_req, xe_ccmd_exec_req)
++
++struct xe_ccmd_exec_rsp {
++   struct vdrm_ccmd_rsp hdr;
++   int32_t ret;
++};
++XE_STATIC_ASSERT_SIZE(xe_ccmd_exec_rsp)
 +
 +#ifdef __GNUC__
 +# pragma GCC diagnostic pop
