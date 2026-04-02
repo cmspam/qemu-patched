@@ -1,4 +1,4 @@
-From bf0bd90c52208cd7a1c7a4b8121bbedcba0d0e80 Mon Sep 17 00:00:00 2001
+From 18154be5ba22588aea611d17730f9ca84c5f0849 Mon Sep 17 00:00:00 2001
 From: cmspam <cmspam>
 Date: Fri, 3 Apr 2026 02:40:46 +0900
 Subject: [PATCH] drm: add xe native-context renderer backend
@@ -9,18 +9,18 @@ Subject: [PATCH] drm: add xe native-context renderer backend
  meson_options.txt         |    1 +
  src/drm/drm-uapi/xe_drm.h | 2459 +++++++++++++++++++++++++++++++++++++
  src/drm/drm_renderer.c    |   46 +-
- src/drm/xe/xe_ccmd.c      |  506 ++++++++
+ src/drm/xe/xe_ccmd.c      |  540 ++++++++
  src/drm/xe/xe_ccmd.h      |   16 +
  src/drm/xe/xe_object.c    |   32 +
  src/drm/xe/xe_object.h    |   19 +
  src/drm/xe/xe_proto.h     |  189 +++
- src/drm/xe/xe_renderer.c  |  104 ++
- src/drm/xe/xe_renderer.h  |   53 +
+ src/drm/xe/xe_renderer.c  |  117 ++
+ src/drm/xe/xe_renderer.h  |   65 +
  src/drm/xe/xe_resource.c  |  146 +++
  src/drm/xe/xe_resource.h  |   20 +
  src/drm_hw.h              |    1 +
  src/meson.build           |   17 +
- 16 files changed, 3610 insertions(+), 6 deletions(-)
+ 16 files changed, 3669 insertions(+), 6 deletions(-)
  create mode 100644 src/drm/drm-uapi/xe_drm.h
  create mode 100644 src/drm/xe/xe_ccmd.c
  create mode 100644 src/drm/xe/xe_ccmd.h
@@ -2645,10 +2645,10 @@ index 3eb33e9b..fa4e4d68 100644
           continue;
 diff --git a/src/drm/xe/xe_ccmd.c b/src/drm/xe/xe_ccmd.c
 new file mode 100644
-index 00000000..8f22e834
+index 00000000..bd220c75
 --- /dev/null
 +++ b/src/drm/xe/xe_ccmd.c
-@@ -0,0 +1,506 @@
+@@ -0,0 +1,540 @@
 +/*
 + * Copyright 2026 Collabora, Ltd.
 + * SPDX-License-Identifier: MIT
@@ -2829,6 +2829,7 @@ index 00000000..8f22e834
 +static int
 +xe_ccmd_exec_queue_create(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 +{
++   struct xe_context *xctx = to_xe_context(dctx);
 +   const struct xe_ccmd_exec_queue_create_req *req = to_xe_ccmd_exec_queue_create_req(hdr);
 +   struct xe_ccmd_exec_queue_create_rsp *rsp;
 +   const size_t instances_size = sizeof(struct drm_xe_engine_class_instance) * req->num_instances;
@@ -2874,6 +2875,24 @@ index 00000000..8f22e834
 +
 +   rsp->ret = xe_ioctl(dctx->fd, DRM_IOCTL_XE_EXEC_QUEUE_CREATE, &create);
 +   rsp->exec_queue_id = create.exec_queue_id;
++   if (rsp->ret)
++      return 0;
++
++   struct xe_exec_queue_data *eq = calloc(1, sizeof(*eq));
++   if (!eq) {
++      struct drm_xe_exec_queue_destroy destroy = {
++         .exec_queue_id = create.exec_queue_id,
++      };
++      xe_ioctl(dctx->fd, DRM_IOCTL_XE_EXEC_QUEUE_DESTROY, &destroy);
++      rsp->ret = ENOMEM;
++      rsp->exec_queue_id = 0;
++      return 0;
++   }
++
++   drm_timeline_init(&eq->timeline, &dctx->base, "xe-exec-queue",
++                     create.exec_queue_id + 1, drm_context_fence_retire);
++   _mesa_hash_table_insert(xctx->exec_queue_table,
++                           (void *)(uintptr_t)(create.exec_queue_id + 1), eq);
 +
 +   return 0;
 +}
@@ -2881,6 +2900,7 @@ index 00000000..8f22e834
 +static int
 +xe_ccmd_exec_queue_destroy(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 +{
++   struct xe_context *xctx = to_xe_context(dctx);
 +   const struct xe_ccmd_exec_queue_destroy_req *req = to_xe_ccmd_exec_queue_destroy_req(hdr);
 +   struct xe_ccmd_rsp *rsp = drm_context_rsp(dctx, hdr, sizeof(*rsp));
 +
@@ -2890,6 +2910,14 @@ index 00000000..8f22e834
 +   struct drm_xe_exec_queue_destroy destroy = {
 +      .exec_queue_id = req->exec_queue_id,
 +   };
++
++   struct hash_entry *entry = hash_table_search(xctx->exec_queue_table, req->exec_queue_id + 1);
++   if (entry) {
++      struct xe_exec_queue_data *eq = entry->data;
++      drm_timeline_fini(&eq->timeline);
++      free(eq);
++      _mesa_hash_table_remove(xctx->exec_queue_table, entry);
++   }
 +
 +   rsp->ret = xe_ioctl(dctx->fd, DRM_IOCTL_XE_EXEC_QUEUE_DESTROY, &destroy);
 +   return 0;
@@ -2939,6 +2967,7 @@ index 00000000..8f22e834
 +   struct drm_syncobj_handle import = {
 +      .handle = handle,
 +      .fd = sync_file_fd,
++      .flags = DRM_SYNCOBJ_FD_TO_HANDLE_FLAGS_IMPORT_SYNC_FILE,
 +   };
 +
 +   if (xe_ioctl(fd, DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE, &import))
@@ -2952,7 +2981,7 @@ index 00000000..8f22e834
 +{
 +   struct drm_syncobj_handle export = {
 +      .handle = handle,
-+      .flags = 0,
++      .flags = DRM_SYNCOBJ_HANDLE_TO_FD_FLAGS_EXPORT_SYNC_FILE,
 +   };
 +
 +   if (xe_ioctl(fd, DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD, &export))
@@ -3015,21 +3044,14 @@ index 00000000..8f22e834
 +      int out_fence_fd = xe_export_sync_file(xctx->base.fd, signal_handle);
 +
 +      if (out_fence_fd >= 0) {
-+         if (ring_idx < ARRAY_SIZE(xctx->timelines)) {
-+            if (!xctx->timelines[ring_idx]) {
-+               xctx->timelines[ring_idx] = calloc(1, sizeof(*xctx->timelines[ring_idx]));
-+               if (xctx->timelines[ring_idx]) {
-+                  drm_timeline_init(xctx->timelines[ring_idx], &xctx->base.base,
-+                                    "xe-sync", ring_idx, drm_context_fence_retire);
-+               }
-+            }
-+
-+            if (xctx->timelines[ring_idx])
-+               drm_timeline_set_last_fence_fd(xctx->timelines[ring_idx], out_fence_fd);
++         if (ring_idx == 0) {
++            close(out_fence_fd);
++         } else {
++            struct xe_exec_queue_data *eq = xe_context_get_queue_data(xctx, ring_idx - 1);
++            if (eq)
++               drm_timeline_set_last_fence_fd(&eq->timeline, out_fence_fd);
 +            else
 +               close(out_fence_fd);
-+         } else {
-+            close(out_fence_fd);
 +         }
 +      }
 +
@@ -3093,6 +3115,18 @@ index 00000000..8f22e834
 +      bind.bind = binds[0];
 +
 +   rsp->ret = xe_ioctl(dctx->fd, DRM_IOCTL_XE_VM_BIND, &bind);
++
++   if (!rsp->ret && signal_handle) {
++      struct drm_syncobj_wait wait = {
++         .handles = (uintptr_t)&signal_handle,
++         .count_handles = 1,
++         .timeout_nsec = INT64_MAX,
++         .flags = DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL,
++      };
++
++      if (xe_ioctl(dctx->fd, DRM_IOCTL_SYNCOBJ_WAIT, &wait))
++         rsp->ret = errno;
++   }
 +
 +   xe_finish_submit_syncs(xctx, req->ring_idx, wait_handle, signal_handle);
 +   return 0;
@@ -3437,10 +3471,10 @@ index 00000000..a8c8a11f
 +#endif /* XE_VIRTIO_PROTO_H_ */
 diff --git a/src/drm/xe/xe_renderer.c b/src/drm/xe/xe_renderer.c
 new file mode 100644
-index 00000000..294c1569
+index 00000000..2b396876
 --- /dev/null
 +++ b/src/drm/xe/xe_renderer.c
-@@ -0,0 +1,104 @@
+@@ -0,0 +1,117 @@
 +/*
 + * Copyright 2026 Collabora, Ltd.
 + * SPDX-License-Identifier: MIT
@@ -3494,12 +3528,12 @@ index 00000000..294c1569
 +   struct drm_context *dctx = to_drm_context(vctx);
 +   struct xe_context *xctx = to_xe_context(dctx);
 +
-+   for (unsigned i = 0; i < ARRAY_SIZE(xctx->timelines); i++) {
-+      if (xctx->timelines[i]) {
-+         drm_timeline_fini(xctx->timelines[i]);
-+         free(xctx->timelines[i]);
-+      }
++   hash_table_foreach(xctx->exec_queue_table, entry) {
++      struct xe_exec_queue_data *eq = entry->data;
++      drm_timeline_fini(&eq->timeline);
++      free(eq);
 +   }
++   _mesa_hash_table_destroy(xctx->exec_queue_table, NULL);
 +
 +   drm_context_deinit(dctx);
 +   free(xctx);
@@ -3507,22 +3541,24 @@ index 00000000..294c1569
 +
 +static int
 +xe_renderer_submit_fence(struct virgl_context *vctx, uint32_t flags,
-+                         uint32_t queue_id, uint64_t fence_id)
++                         uint32_t ring_idx, uint64_t fence_id)
 +{
 +   struct drm_context *dctx = to_drm_context(vctx);
 +   struct xe_context *xctx = to_xe_context(dctx);
++   struct xe_exec_queue_data *eq;
 +
-+   if (queue_id >= ARRAY_SIZE(xctx->timelines)) {
-+      drm_err("invalid queue_id: %u", queue_id);
-+      return -EINVAL;
-+   }
-+
-+   if (!xctx->timelines[queue_id] || xctx->timelines[queue_id]->last_fence_fd < 0) {
-+      vctx->fence_retire(vctx, queue_id, fence_id);
++   if (ring_idx == 0) {
++      vctx->fence_retire(vctx, ring_idx, fence_id);
 +      return 0;
 +   }
 +
-+   return drm_timeline_submit_fence(xctx->timelines[queue_id], flags, fence_id);
++   eq = xe_context_get_queue_data(xctx, ring_idx - 1);
++   if (!eq || eq->timeline.last_fence_fd < 0) {
++      vctx->fence_retire(vctx, ring_idx, fence_id);
++      return 0;
++   }
++
++   return drm_timeline_submit_fence(&eq->timeline, flags, fence_id);
 +}
 +
 +struct virgl_context *
@@ -3533,7 +3569,17 @@ index 00000000..294c1569
 +   if (!xctx)
 +      return NULL;
 +
-+   drm_context_init(&xctx->base, fd, xe_ccmd_dispatch, xe_ccmd_dispatch_size);
++   if (!drm_context_init(&xctx->base, fd, xe_ccmd_dispatch, xe_ccmd_dispatch_size)) {
++      free(xctx);
++      return NULL;
++   }
++
++   xctx->exec_queue_table = _mesa_hash_table_create_u32_keys(NULL);
++   if (!xctx->exec_queue_table) {
++      drm_context_deinit(&xctx->base);
++      free(xctx);
++      return NULL;
++   }
 +
 +   xctx->base.base.destroy = xe_renderer_destroy;
 +   xctx->base.base.attach_resource = xe_renderer_attach_resource;
@@ -3542,15 +3588,16 @@ index 00000000..294c1569
 +   xctx->base.base.submit_fence = xe_renderer_submit_fence;
 +   xctx->base.base.supports_fence_sharing = true;
 +   xctx->base.free_object = xe_renderer_free_object;
++   xctx->base.ccmd_alignment = 8;
 +
 +   return &xctx->base.base;
 +}
 diff --git a/src/drm/xe/xe_renderer.h b/src/drm/xe/xe_renderer.h
 new file mode 100644
-index 00000000..e1b6f581
+index 00000000..9174a9d5
 --- /dev/null
 +++ b/src/drm/xe/xe_renderer.h
-@@ -0,0 +1,53 @@
+@@ -0,0 +1,65 @@
 +/*
 + * Copyright 2026 Collabora, Ltd.
 + * SPDX-License-Identifier: MIT
@@ -3581,6 +3628,7 @@ index 00000000..e1b6f581
 +#include "drm_fence.h"
 +#include "drm_hw.h"
 +#include "drm_util.h"
++#include "util/hash_table.h"
 +#include "xe_proto.h"
 +
 +#pragma GCC diagnostic push
@@ -3594,14 +3642,25 @@ index 00000000..e1b6f581
 +
 +#pragma GCC diagnostic pop
 +
++struct xe_exec_queue_data {
++   struct drm_timeline timeline;
++};
++
 +struct xe_context {
 +   struct drm_context base;
-+   struct drm_timeline *timelines[65];
++   struct hash_table *exec_queue_table;
 +};
 +DEFINE_CAST(drm_context, xe_context)
 +
 +int xe_renderer_probe(int fd, struct virgl_renderer_capset_drm *capset);
 +struct virgl_context *xe_renderer_create(int fd, size_t debug_len, const char *debug_name);
++
++static inline struct xe_exec_queue_data *
++xe_context_get_queue_data(struct xe_context *xctx, uint32_t exec_queue_id)
++{
++   struct hash_entry *e = hash_table_search(xctx->exec_queue_table, exec_queue_id + 1);
++   return e ? e->data : NULL;
++}
 +
 +#endif /* XE_RENDERER_H_ */
 diff --git a/src/drm/xe/xe_resource.c b/src/drm/xe/xe_resource.c
