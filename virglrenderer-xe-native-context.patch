@@ -1,4 +1,4 @@
-From 64096fd18605eb8f202fe30b53ea6c122d65fc72 Mon Sep 17 00:00:00 2001
+From edaeb96e9931cbc74637a039384cda031ae91290 Mon Sep 17 00:00:00 2001
 From: cmspam <cmspam>
 Date: Fri, 3 Apr 2026 00:53:08 +0900
 Subject: [PATCH] drm: add Intel Xe native context backend
@@ -2604,7 +2604,7 @@ index 3eb33e9..61963ff 100644
  int
 diff --git a/src/drm/xe/xe_ccmd.c b/src/drm/xe/xe_ccmd.c
 new file mode 100644
-index 0000000..21959da
+index 0000000..330bcb8
 --- /dev/null
 +++ b/src/drm/xe/xe_ccmd.c
 @@ -0,0 +1,446 @@
@@ -2677,7 +2677,7 @@ index 0000000..21959da
 +      .size = req->size,
 +      .placement = req->placement,
 +      .flags = req->flags,
-+      .vm_id = req->vm_id,
++      .vm_id = 0,  /* must be 0: vm_id != 0 makes the BO non-exportable */
 +      .cpu_caching = req->cpu_caching,
 +   };
 +
