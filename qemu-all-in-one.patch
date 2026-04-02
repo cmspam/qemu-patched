@@ -55,13 +55,15 @@ index 2b7a41c..4fb64bf 100644
  
  static void virtio_gpu_gl_device_unrealize(DeviceState *qdev)
 diff --git a/hw/display/virtio-gpu-virgl.c b/hw/display/virtio-gpu-virgl.c
-index b7a2d16..1dd5700 100644
+index b7a2d16..41bee3b 100644
 --- a/hw/display/virtio-gpu-virgl.c
 +++ b/hw/display/virtio-gpu-virgl.c
-@@ -17,11 +17,20 @@
+@@ -17,11 +17,22 @@
  #include "trace.h"
  #include "hw/virtio/virtio.h"
  #include "hw/virtio/virtio-gpu.h"
++#include "hw/virtio/virtio-dmabuf.h"
++#include "qemu/uuid.h"
 +#include "hw/virtio/virtio-dmabuf.h"
 +#include "qemu/uuid.h"
  #include "hw/virtio/virtio-gpu-bswap.h"
@@ -79,9 +81,52 @@ index b7a2d16..1dd5700 100644
  #include <virglrenderer.h>
  
  /*
-@@ -1025,6 +1034,49 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
+@@ -1024,7 +1035,92 @@ static void virgl_cmd_set_scanout_blob(VirtIOGPU *g,
+ }
  #endif
  
++static void virgl_cmd_resource_assign_uuid(VirtIOGPU *g,
++                                           struct virtio_gpu_ctrl_command *cmd)
++{
++    struct virtio_gpu_resource_assign_uuid assign;
++    struct virtio_gpu_resp_resource_uuid resp;
++    struct virtio_gpu_simple_resource *res;
++    QemuUUID uuid;
++
++    VIRTIO_GPU_FILL_CMD(assign);
++    trace_virtio_gpu_cmd_res_assign_uuid(assign.resource_id);
++
++    if (!virtio_gpu_resource_uuid_enabled(g->parent_obj.conf)) {
++        qemu_log_mask(LOG_GUEST_ERROR,
++                      "%s: resource uuid feature not negotiated\n", __func__);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_PARAMETER;
++        return;
++    }
++
++    res = virtio_gpu_find_resource(g, assign.resource_id);
++    if (!res) {
++        qemu_log_mask(LOG_GUEST_ERROR, "%s: resource 0x%x not found\n",
++                      __func__, assign.resource_id);
++        cmd->error = VIRTIO_GPU_RESP_ERR_INVALID_RESOURCE_ID;
++        return;
++    }
++
++    memset(&resp, 0, sizeof(resp));
++    resp.hdr.type = VIRTIO_GPU_RESP_OK_RESOURCE_UUID;
++    qemu_uuid_generate(&uuid);
++
++    if (res->dmabuf_fd >= 0) {
++        if (!virtio_add_dmabuf(&uuid, res->dmabuf_fd)) {
++            qemu_log_mask(LOG_GUEST_ERROR,
++                          "%s: failed to register dmabuf for resource 0x%x\n",
++                          __func__, assign.resource_id);
++        }
++    }
++
++    memcpy(resp.uuid, &uuid, sizeof(uuid));
++    virtio_gpu_ctrl_response(g, cmd, &resp.hdr, sizeof(resp));
++}
++
  void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
 +static void virgl_cmd_resource_assign_uuid(VirtIOGPU *g,
 +                                           struct virtio_gpu_ctrl_command *cmd)
@@ -129,7 +174,7 @@ index b7a2d16..1dd5700 100644
                                        struct virtio_gpu_ctrl_command *cmd)
  {
      bool cmd_suspended = false;
-@@ -1107,6 +1159,9 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
+@@ -1107,6 +1203,9 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
          virgl_cmd_set_scanout_blob(g, cmd);
          break;
  #endif
@@ -139,7 +184,7 @@ index b7a2d16..1dd5700 100644
      default:
          cmd->error = VIRTIO_GPU_RESP_ERR_UNSPEC;
          break;
-@@ -1350,6 +1405,7 @@ static struct virgl_renderer_callbacks virtio_gpu_3d_cbs = {
+@@ -1350,6 +1449,7 @@ static struct virgl_renderer_callbacks virtio_gpu_3d_cbs = {
  #if VIRGL_VERSION_MAJOR >= 1
      .write_context_fence = virgl_write_context_fence,
  #endif
@@ -147,7 +192,7 @@ index b7a2d16..1dd5700 100644
  };
  
  static void virtio_gpu_print_stats(void *opaque)
-@@ -1432,6 +1488,7 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
+@@ -1432,6 +1532,7 @@ static int virtio_gpu_virgl_init(VirtIOGPU *g)
      int ret;
      uint32_t flags = 0;
      VirtIOGPUGL *gl = VIRTIO_GPU_GL(g);
