@@ -37,7 +37,7 @@
 
         # 1. Your custom virglrenderer (The 'Replacement')
         virglrenderer-git = prev.virglrenderer.overrideAttrs (oldAttrs: {
-          version = "7.8.1";
+          version = "7.8.2";
           src = virglrenderer-src;
           patches = (oldAttrs.patches or [ ]) ++ [
             ./virglrenderer-xe-native-context.patch
