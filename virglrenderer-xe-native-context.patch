@@ -1,4 +1,4 @@
-From db335d4b0c82ed762db5ed14cb45de7449d78c5b Mon Sep 17 00:00:00 2001
+From d357666c568b91dded633d8cfe178c0dd3baaa74 Mon Sep 17 00:00:00 2001
 From: cmspam <cmspam>
 Date: Fri, 3 Apr 2026 02:40:46 +0900
 Subject: [PATCH] drm: add xe native-context renderer backend
@@ -7,7 +7,7 @@ Subject: [PATCH] drm: add xe native-context renderer backend
  meson.build               |    6 +
  meson_options.txt         |    1 +
  src/drm/drm-uapi/xe_drm.h | 2459 +++++++++++++++++++++++++++++++++++++
- src/drm/drm_renderer.c    |   33 +-
+ src/drm/drm_renderer.c    |   46 +-
  src/drm/xe/xe_ccmd.c      |  495 ++++++++
  src/drm/xe/xe_ccmd.h      |   16 +
  src/drm/xe/xe_object.c    |   32 +
@@ -19,7 +19,7 @@ Subject: [PATCH] drm: add xe native-context renderer backend
  src/drm/xe/xe_resource.h  |   20 +
  src/drm_hw.h              |    1 +
  src/meson.build           |   17 +
- 15 files changed, 3587 insertions(+), 4 deletions(-)
+ 15 files changed, 3598 insertions(+), 6 deletions(-)
  create mode 100644 src/drm/drm-uapi/xe_drm.h
  create mode 100644 src/drm/xe/xe_ccmd.c
  create mode 100644 src/drm/xe/xe_ccmd.h
@@ -2533,7 +2533,7 @@ index 00000000..3a2bce06
 +
 +#endif /* _XE_DRM_H_ */
 diff --git a/src/drm/drm_renderer.c b/src/drm/drm_renderer.c
-index 3eb33e9b..d07c981a 100644
+index 3eb33e9b..fa4e4d68 100644
 --- a/src/drm/drm_renderer.c
 +++ b/src/drm/drm_renderer.c
 @@ -38,6 +38,10 @@
@@ -2547,7 +2547,7 @@ index 3eb33e9b..d07c981a 100644
  static struct virgl_renderer_capset_drm capset;
  
  static const struct backend {
-@@ -86,15 +90,35 @@ static const struct backend {
+@@ -86,21 +90,44 @@ static const struct backend {
        .create = i915_renderer_create,
     },
  #endif
@@ -2576,6 +2576,7 @@ index 3eb33e9b..d07c981a 100644
  {
 -   for (unsigned i = 0; i < ARRAY_SIZE(backends); i++) {
 -      const struct backend *b = &backends[i];
++retry_without_external_fd:
 +   for (const struct backend *b = backends; b < backends + ARRAY_SIZE(backends); b++) {
        int fd;
  
@@ -2585,7 +2586,39 @@ index 3eb33e9b..d07c981a 100644
        if (drm_fd != -1) {
           fd = drm_fd;
        } else {
-@@ -167,8 +191,9 @@ drm_renderer_capset(void *_c)
+          fd = drmOpenWithType(b->name, NULL, DRM_NODE_RENDER);
+-         if (fd < 0)
++         if (fd < 0) {
++            drm_dbg("failed to open drm backend '%s': %d", b->name, -errno);
+             continue;
++         }
+       }
+ 
+       drmVersionPtr ver = drmGetVersion(fd);
+@@ -116,6 +143,8 @@ drm_renderer_init(int drm_fd)
+           * table to see which one has the matching name.
+           */
+          assert(drm_fd != -1);
++         drm_dbg("external drm fd driver '%s' does not match backend '%s'",
++                 ver->name, b->name);
+          drmFreeVersion(ver);
+          continue;
+       }
+@@ -134,8 +163,12 @@ drm_renderer_init(int drm_fd)
+       return ret;
+    }
+ 
+-   if (drm_fd != -1)
++   if (drm_fd != -1) {
++      drm_dbg("external drm fd did not match any enabled backend; retrying autodetect");
+       close(drm_fd);
++      drm_fd = -1;
++      goto retry_without_external_fd;
++   }
+ 
+    return -ENODEV;
+ }
+@@ -167,8 +200,9 @@ drm_renderer_capset(void *_c)
  struct virgl_context *
  drm_renderer_create(size_t debug_len, const char *debug_name, int drm_fd)
  {
