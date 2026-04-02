@@ -1,4 +1,4 @@
-From 41ae1087e4535ee603211a3bd1a3f43e35ade4bc Mon Sep 17 00:00:00 2001
+From 79aab6025c0ed1f9523d794fd4094426f081a7da Mon Sep 17 00:00:00 2001
 From: cmspam <cmspam>
 Date: Fri, 3 Apr 2026 02:40:46 +0900
 Subject: [PATCH] drm: add xe native-context renderer backend
@@ -9,7 +9,7 @@ Subject: [PATCH] drm: add xe native-context renderer backend
  meson_options.txt         |    1 +
  src/drm/drm-uapi/xe_drm.h | 2459 +++++++++++++++++++++++++++++++++++++
  src/drm/drm_renderer.c    |   46 +-
- src/drm/xe/xe_ccmd.c      |  495 ++++++++
+ src/drm/xe/xe_ccmd.c      |  506 ++++++++
  src/drm/xe/xe_ccmd.h      |   16 +
  src/drm/xe/xe_object.c    |   32 +
  src/drm/xe/xe_object.h    |   19 +
@@ -20,7 +20,7 @@ Subject: [PATCH] drm: add xe native-context renderer backend
  src/drm/xe/xe_resource.h  |   20 +
  src/drm_hw.h              |    1 +
  src/meson.build           |   17 +
- 16 files changed, 3599 insertions(+), 6 deletions(-)
+ 16 files changed, 3610 insertions(+), 6 deletions(-)
  create mode 100644 src/drm/drm-uapi/xe_drm.h
  create mode 100644 src/drm/xe/xe_ccmd.c
  create mode 100644 src/drm/xe/xe_ccmd.h
@@ -2645,10 +2645,10 @@ index 3eb33e9b..fa4e4d68 100644
           continue;
 diff --git a/src/drm/xe/xe_ccmd.c b/src/drm/xe/xe_ccmd.c
 new file mode 100644
-index 00000000..84248b25
+index 00000000..8d4117eb
 --- /dev/null
 +++ b/src/drm/xe/xe_ccmd.c
-@@ -0,0 +1,495 @@
+@@ -0,0 +1,506 @@
 +/*
 + * Copyright 2026 Collabora, Ltd.
 + * SPDX-License-Identifier: MIT
@@ -2842,8 +2842,19 @@ index 00000000..84248b25
 +   uint8_t *payload = (uint8_t *)req->payload;
 +   struct drm_xe_engine_class_instance *instances = (void *)payload;
 +   uint8_t *ext_payload = payload + instances_size;
++   uint64_t ext_off = req->extensions;
 +
-+   if (!xe_rebuild_extensions(ext_payload, req->ext_size, req->extensions)) {
++   if (req->ext_size) {
++      if (!ext_off || ext_off < instances_size || ext_off >= instances_size + req->ext_size) {
++         drm_err("invalid extension chain start: %" PRIu64, req->extensions);
++         return -EINVAL;
++      }
++      ext_off -= instances_size;
++   } else {
++      ext_off = 0;
++   }
++
++   if (!xe_rebuild_extensions(ext_payload, req->ext_size, ext_off)) {
 +      drm_err("invalid extension chain");
 +      return -EINVAL;
 +   }
@@ -2853,7 +2864,7 @@ index 00000000..84248b25
 +      return -ENOMEM;
 +
 +   struct drm_xe_exec_queue_create create = {
-+      .extensions = req->ext_size ? (uintptr_t)ext_payload : 0,
++      .extensions = req->ext_size ? (uintptr_t)(ext_payload + ext_off) : 0,
 +      .vm_id = req->vm_id,
 +      .flags = req->flags,
 +      .width = req->width,
