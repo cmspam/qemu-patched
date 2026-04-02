@@ -1,4 +1,4 @@
-From 18154be5ba22588aea611d17730f9ca84c5f0849 Mon Sep 17 00:00:00 2001
+From 52c0b20f919a540c446b55642853cd4942224fde Mon Sep 17 00:00:00 2001
 From: cmspam <cmspam>
 Date: Fri, 3 Apr 2026 02:40:46 +0900
 Subject: [PATCH] drm: add xe native-context renderer backend
@@ -2645,7 +2645,7 @@ index 3eb33e9b..fa4e4d68 100644
           continue;
 diff --git a/src/drm/xe/xe_ccmd.c b/src/drm/xe/xe_ccmd.c
 new file mode 100644
-index 00000000..bd220c75
+index 00000000..60080b77
 --- /dev/null
 +++ b/src/drm/xe/xe_ccmd.c
 @@ -0,0 +1,540 @@
@@ -3105,7 +3105,7 @@ index 00000000..bd220c75
 +
 +   struct drm_xe_vm_bind bind = {
 +      .vm_id = req->vm_id,
-+      .exec_queue_id = req->exec_queue_id,
++      .exec_queue_id = 0,
 +      .num_binds = req->num_binds,
 +      .vector_of_binds = req->num_binds > 1 ? (uintptr_t)binds : 0,
 +      .num_syncs = num_syncs,
