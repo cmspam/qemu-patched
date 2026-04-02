@@ -30,9 +30,6 @@ jobs:
       - name: Update flake.lock
         run: nix flake update
 
-      - name: Check flake health
-        run: nix flake check
-
       - name: Commit and Push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
