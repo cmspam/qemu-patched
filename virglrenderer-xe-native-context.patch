@@ -1,4 +1,4 @@
-From e70a1cba4800907ccc849979247963726cd23109 Mon Sep 17 00:00:00 2001
+From 0f9ada3c5eb5db90073a54f0fe52b5082d55b599 Mon Sep 17 00:00:00 2001
 From: cmspam <cmspam>
 Date: Fri, 3 Apr 2026 02:40:46 +0900
 Subject: [PATCH] drm: add xe native-context renderer backend
@@ -7,7 +7,7 @@ Subject: [PATCH] drm: add xe native-context renderer backend
  meson.build               |    6 +
  meson_options.txt         |    1 +
  src/drm/drm-uapi/xe_drm.h | 2459 +++++++++++++++++++++++++++++++++++++
- src/drm/drm_renderer.c    |   12 +
+ src/drm/drm_renderer.c    |   18 +-
  src/drm/xe/xe_ccmd.c      |  495 ++++++++
  src/drm/xe/xe_ccmd.h      |   16 +
  src/drm/xe/xe_object.c    |   32 +
@@ -19,7 +19,7 @@ Subject: [PATCH] drm: add xe native-context renderer backend
  src/drm/xe/xe_resource.h  |   20 +
  src/drm_hw.h              |    1 +
  src/meson.build           |   17 +
- 15 files changed, 3570 insertions(+)
+ 15 files changed, 3572 insertions(+), 4 deletions(-)
  create mode 100644 src/drm/drm-uapi/xe_drm.h
  create mode 100644 src/drm/xe/xe_ccmd.c
  create mode 100644 src/drm/xe/xe_ccmd.h
@@ -2533,7 +2533,7 @@ index 00000000..3a2bce06
 +
 +#endif /* _XE_DRM_H_ */
 diff --git a/src/drm/drm_renderer.c b/src/drm/drm_renderer.c
-index 3eb33e9b..61963ff1 100644
+index 3eb33e9b..f5b8ff80 100644
 --- a/src/drm/drm_renderer.c
 +++ b/src/drm/drm_renderer.c
 @@ -38,6 +38,10 @@
@@ -2547,7 +2547,7 @@ index 3eb33e9b..61963ff1 100644
  static struct virgl_renderer_capset_drm capset;
  
  static const struct backend {
-@@ -86,6 +90,14 @@ static const struct backend {
+@@ -86,13 +90,20 @@ static const struct backend {
        .create = i915_renderer_create,
     },
  #endif
@@ -2562,6 +2562,24 @@ index 3eb33e9b..61963ff1 100644
  };
  
  int
+ drm_renderer_init(int drm_fd)
+ {
+-   for (unsigned i = 0; i < ARRAY_SIZE(backends); i++) {
+-      const struct backend *b = &backends[i];
++   for (const struct backend *b = backends; b < backends + ARRAY_SIZE(backends); b++) {
+       int fd;
+ 
+       if (drm_fd != -1) {
+@@ -167,8 +178,7 @@ drm_renderer_capset(void *_c)
+ struct virgl_context *
+ drm_renderer_create(size_t debug_len, const char *debug_name, int drm_fd)
+ {
+-   for (unsigned i = 0; i < ARRAY_SIZE(backends); i++) {
+-      const struct backend *b = &backends[i];
++   for (const struct backend *b = backends; b < backends + ARRAY_SIZE(backends); b++) {
+ 
+       if (b->context_type != capset.context_type)
+          continue;
 diff --git a/src/drm/xe/xe_ccmd.c b/src/drm/xe/xe_ccmd.c
 new file mode 100644
 index 00000000..974287cc
