@@ -1,4 +1,4 @@
-From 82c56c3e47050972ecaab4a24d7993b70f6c0e86 Mon Sep 17 00:00:00 2001
+From bf0bd90c52208cd7a1c7a4b8121bbedcba0d0e80 Mon Sep 17 00:00:00 2001
 From: cmspam <cmspam>
 Date: Fri, 3 Apr 2026 02:40:46 +0900
 Subject: [PATCH] drm: add xe native-context renderer backend
@@ -2645,7 +2645,7 @@ index 3eb33e9b..fa4e4d68 100644
           continue;
 diff --git a/src/drm/xe/xe_ccmd.c b/src/drm/xe/xe_ccmd.c
 new file mode 100644
-index 00000000..41b77c63
+index 00000000..8f22e834
 --- /dev/null
 +++ b/src/drm/xe/xe_ccmd.c
 @@ -0,0 +1,506 @@
@@ -2692,7 +2692,7 @@ index 00000000..41b77c63
 +   if (!ext_size)
 +      return first_ext == 0;
 +
-+   if (!first_ext)
++   if (first_ext >= ext_size)
 +      return false;
 +
 +   uint8_t *start = payload;
