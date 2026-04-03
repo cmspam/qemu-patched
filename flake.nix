@@ -37,10 +37,11 @@
 
         # 1. Your custom virglrenderer (The 'Replacement')
         virglrenderer-git = prev.virglrenderer.overrideAttrs (oldAttrs: {
-          version = "7.8.2";
+          version = "7.8.3";
           src = virglrenderer-src;
           patches = (oldAttrs.patches or [ ]) ++ [
             ./virglrenderer-xe-native-context.patch
+            ./virglrenderer-xe-map-cache-fix.patch
           ];
           mesonFlags = (oldAttrs.mesonFlags or [ ]) ++ [
             "-Ddrm-renderers=xe-experimental"
