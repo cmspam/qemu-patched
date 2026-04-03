@@ -1,0 +1,19 @@
+diff --git a/src/drm/xe/xe_resource.c b/src/drm/xe/xe_resource.c
+index 6f5f4c3..c2b7c9a 100644
+--- a/src/drm/xe/xe_resource.c
++++ b/src/drm/xe/xe_resource.c
+@@ -137,6 +137,14 @@ xe_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob
+    }
+ 
+    blob->map_info = to_xe_object(dobj)->map_info;
++   if (!(blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_SHAREABLE) &&
++       blob->map_info == VIRGL_RENDERER_MAP_CACHE_WC) {
++      /*
++       * Opaque blobs are primarily CPU-mapped upload paths. Prefer cached maps
++       * here to avoid very slow host write-combined memcpy throughput.
++       */
++      blob->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
++   }
+    drm_context_object_set_res_id(dctx, dobj, res_id);
+ 
+    return 0;
