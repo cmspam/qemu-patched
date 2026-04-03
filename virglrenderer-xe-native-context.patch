@@ -79,10 +79,10 @@ index 3eb33e9..0b81a18 100644
  int
 diff --git a/src/drm/xe/xe_ccmd.c b/src/drm/xe/xe_ccmd.c
 new file mode 100644
-index 0000000..377aa47
+index 0000000..2245719
 --- /dev/null
 +++ b/src/drm/xe/xe_ccmd.c
-@@ -0,0 +1,410 @@
+@@ -0,0 +1,419 @@
 +/*
 + * Copyright 2025 Google LLC
 + * SPDX-License-Identifier: MIT
@@ -179,6 +179,11 @@ index 0000000..377aa47
 +   return 0;
 +}
 +
++/* VM binds are performed synchronously on the host side: we attach a
++ * temporary syncobj, submit the bind, and wait for completion before
++ * returning the result to the guest.  This guarantees that mappings are
++ * visible before any dependent exec submissions.
++ */
 +static int
 +xe_ccmd_vm_bind(struct drm_context *dctx, struct vdrm_ccmd_req *hdr)
 +{
@@ -457,6 +462,10 @@ index 0000000..377aa47
 +         drm_timeline_set_last_fence_fd(&eq->timeline, sh.fd);
 +   }
 +
++   /* Mark the exec queue as banned in shared memory so the guest can
++    * detect GPU hangs.  The mask is a uint64_t, limiting tracking to
++    * the first 64 queue IDs.
++    */
 +   if (rsp->ret == EIO) {
 +      struct xe_shmem *shmem = to_xe_shmem(dctx->shmem);
 +      if (shmem && req->exec_queue_id < 64) {
@@ -1238,14 +1247,15 @@ index ed677f3..d9827cd 100644
     virgl_sources += proxy_sources
  endif
 diff --git a/src/virglrenderer.c b/src/virglrenderer.c
-index 79717fc..88cd456 100644
+index 79717fc..746f3e6 100644
 --- a/src/virglrenderer.c
 +++ b/src/virglrenderer.c
-@@ -573,7 +573,7 @@ void virgl_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
+@@ -573,7 +573,8 @@ void virgl_renderer_get_cap_set(uint32_t cap_set, uint32_t *max_ver,
        *max_size = proxy_get_capset(cap_set, NULL);
        break;
     case VIRTGPU_DRM_CAPSET_DRM:
 -      *max_ver = 0;
++      /* Version 1 adds Xe native context support (new context type + payload). */
 +      *max_ver = 1;
        *max_size = drm_renderer_capset(NULL);
        break;
