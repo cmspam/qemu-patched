@@ -35,24 +35,32 @@
     {
       overlays.default = final: prev: {
 
-        # 1. Your custom virglrenderer (The 'Replacement')
-        virglrenderer-git = prev.virglrenderer.overrideAttrs (oldAttrs: {
-          version = "9.9.8";
+        # virglrenderer built from git HEAD with MR!1268:
+        # "vrend: support linear gbm_bo blob resources for dGPU prime"
+        # This is the host-side counterpart to mesa MR!23896 -- without it,
+        # the guest can request a linear GBM-backed blob resource but the host
+        # virglrenderer won't create one, causing dmabuf import to fail.
+        virglrenderer = prev.virglrenderer.overrideAttrs (oldAttrs: {
+          version = "git-${virglrenderer-src.shortRev or virglrenderer-src.rev}";
           src = virglrenderer-src;
+
           patches = (oldAttrs.patches or [ ]) ++ [
             ./virglrenderer-xe-native-context.patch
           ];
+
+          # GBM allocation must be enabled for the patch to activate --
+          # the key code paths are gated on ENABLE_GBM_ALLOCATION
           mesonFlags = (oldAttrs.mesonFlags or [ ]) ++ [
             "-Ddrm-renderers=xe-experimental"
           ];
         });
 
-        # 2. QEMU Base (Built against upstream virglrenderer)
-        # This derivation remains static unless you change QEMU patches/src.
-        qemu-base = (prev.qemu.override {
-          # Use PREV virglrenderer so this build is cached/stable
-          virglrenderer    = prev.virglrenderer;
+        # QEMU built from git HEAD, using our git virglrenderer, with full graphics stack
+        qemu = (prev.qemu.override {
+          # Use our git virglrenderer
+          virglrenderer    = final.virglrenderer;
 
+          # Graphics / display
           virglSupport     = true;
           openGLSupport    = true;
           sdlSupport       = true;
@@ -60,9 +68,13 @@
           vncSupport       = true;
           spiceSupport     = true;
           usbredirSupport  = true;
+
+          # Audio
           pulseSupport     = true;
           pipewireSupport  = true;
           alsaSupport      = true;
+
+          # System / misc
           numaSupport      = true;
           seccompSupport   = true;
           smartcardSupport = true;
@@ -83,12 +95,15 @@
           preConfigure = ''
             touch .git
             mkdir -p subprojects
+
             cp -a ${inputs.keycodemapdb} subprojects/keycodemapdb
             cp -a ${inputs.berkeley-softfloat-3} subprojects/berkeley-softfloat-3
             cp -a ${inputs.berkeley-testfloat-3} subprojects/berkeley-testfloat-3
             chmod -R +w subprojects/
+
             cp -r subprojects/packagefiles/berkeley-softfloat-3/* subprojects/berkeley-softfloat-3/
             cp -r subprojects/packagefiles/berkeley-testfloat-3/* subprojects/berkeley-testfloat-3/
+
             rm -rf build/meson-private
           '';
 
@@ -107,17 +122,6 @@
 
           doCheck = false;
         });
-
-        # 3. The final 'qemu' attribute (The Graft)
-        # This replaces the references to upstream virglrenderer with your git version.
-        qemu = prev.replaceDependency {
-          drv = final.qemu-base;
-          oldDependency = prev.virglrenderer;
-          newDependency = final.virglrenderer-git;
-        };
-
-        # Alias for consistency with your packages block
-        virglrenderer = final.virglrenderer-git;
       };
 
       packages = forAllSystems (system:
