@@ -1,19 +1,17 @@
-diff --git a/src/drm/xe/xe_resource.c b/src/drm/xe/xe_resource.c
-index 6f5f4c3..c2b7c9a 100644
---- a/src/drm/xe/xe_resource.c
-+++ b/src/drm/xe/xe_resource.c
-@@ -137,6 +137,14 @@ xe_renderer_get_blob(struct virgl_context *vctx, uint32_t res_id, uint64_t blob
-    }
+diff --git a/src/drm/xe/xe_object.c b/src/drm/xe/xe_object.c
+--- a/src/drm/xe/xe_object.c
++++ b/src/drm/xe/xe_object.c
+@@ -21,7 +21,12 @@ xe_object_create(uint32_t handle, uint64_t size, uint16_t cpu_caching)
  
-    blob->map_info = to_xe_object(dobj)->map_info;
-+   if (!(blob_flags & VIRGL_RENDERER_BLOB_FLAG_USE_SHAREABLE) &&
-+       blob->map_info == VIRGL_RENDERER_MAP_CACHE_WC) {
+    switch (cpu_caching) {
+    case DRM_XE_GEM_CPU_CACHING_WC:
+-      obj->map_info = VIRGL_RENDERER_MAP_CACHE_WC;
 +      /*
-+       * Opaque blobs are primarily CPU-mapped upload paths. Prefer cached maps
-+       * here to avoid very slow host write-combined memcpy throughput.
++       * In virtio vdrm guests, write-combined blob mappings can become
++       * pathologically slow for CPU upload workloads. Prefer cached mapping
++       * policy for guest-visible blobs.
 +       */
-+      blob->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
-+   }
-    drm_context_object_set_res_id(dctx, dobj, res_id);
- 
-    return 0;
++      obj->map_info = VIRGL_RENDERER_MAP_CACHE_CACHED;
+       break;
+    case DRM_XE_GEM_CPU_CACHING_WB:
+    default:
