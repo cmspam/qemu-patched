@@ -50,11 +50,11 @@
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1775423009,
-        "narHash": "sha256-vPKLpjhIVWdDrfiUM8atW6YkIggCEKdSAlJPzzhkQlw=",
+        "lastModified": 1775710090,
+        "narHash": "sha256-ar3rofg+awPB8QXDaFJhJ2jJhu+KqN/PRCXeyuXR76E=",
         "owner": "nixos",
         "repo": "nixpkgs",
-        "rev": "68d8aa3d661f0e6bd5862291b5bb263b2a6595c9",
+        "rev": "4c1018dae018162ec878d42fec712642d214fdfa",
         "type": "github"
       },
       "original": {
@@ -67,11 +67,11 @@
     "qemu-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1775746481,
-        "narHash": "sha256-ZHrdNI0bUSTdlYgRbkGVM2YEPBekBqbkyzJgTntzkO0=",
+        "lastModified": 1775765936,
+        "narHash": "sha256-/0P/NOYKu/Klyff8kASAJ9HLZRgkduchqjjua9ZKYyc=",
         "ref": "refs/heads/master",
-        "rev": "8969ee84d431527dfde4c0276a944eaa4f240323",
-        "revCount": 128270,
+        "rev": "becd22fdc2a071783d9e04421526633772b3b98c",
+        "revCount": 128271,
         "type": "git",
         "url": "https://gitlab.com/qemu-project/qemu.git"
       },
