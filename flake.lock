@@ -67,11 +67,11 @@
     "qemu-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1776089581,
-        "narHash": "sha256-Sb/ek4qZDJLeui3Vd5P5S1+uelBc7ojoZld9gPOKmtQ=",
+        "lastModified": 1776178666,
+        "narHash": "sha256-2HEkEdmm8g/7hHyR9WNUYY/+0ipZDoWILpH7K6R8LK8=",
         "ref": "refs/heads/master",
-        "rev": "45cad8beca3ad75ebe63a36fdc60c98395fd2df1",
-        "revCount": 128273,
+        "rev": "985062e2319e6bf4a4be9c216ede6d34379e5777",
+        "revCount": 128277,
         "type": "git",
         "url": "https://gitlab.com/qemu-project/qemu.git"
       },
