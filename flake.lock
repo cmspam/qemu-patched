@@ -94,11 +94,11 @@
       "flake": false,
       "locked": {
         "host": "gitlab.freedesktop.org",
-        "lastModified": 1776266906,
-        "narHash": "sha256-Gk8Q7KSqn65SVT6LVxCfRthDtgLnIupb4Qe3Kv2EEws=",
+        "lastModified": 1776642589,
+        "narHash": "sha256-UfohIEh3qb1hXBSnaUcTbnJglAsVZEfawVyLPCLg4iM=",
         "owner": "virgl",
         "repo": "virglrenderer",
-        "rev": "4e19e9992bc2fe8686fe844666626e03d8ec6e61",
+        "rev": "23d4e31c9108051f7d5b09250f5959f795216730",
         "type": "gitlab"
       },
       "original": {
