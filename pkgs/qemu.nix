@@ -29,7 +29,7 @@
 
   src = prev.fetchurl {
     url = "https://download.qemu.org/qemu-${version}.tar.xz";
-    hash = "sha256-8enC18aUK8dAkdpU2tB682/arb82Ydf7unfYSNjh4ek=";
+    hash = "sha256-wEyjYBJlPzLRHGdNNwz1KnEOfT8Ywti2PkkyBSpIVNY";
   };
 
   patches = (oldAttrs.patches or []) ++ [
