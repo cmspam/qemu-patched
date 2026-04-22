@@ -35,4 +35,14 @@
   patches = (oldAttrs.patches or []) ++ [
     "${patchSrc}/qemu-all-in-one.patch"
   ];
+
+  nativeBuildInputs = (oldAttrs.nativeBuildInputs or []) ++ [
+    prev.python3Packages.setuptools
+    prev.python3Packages.wheel
+    prev.python3Packages.pip
+  ];
+
+  configureFlags = (oldAttrs.configureFlags or []) ++ [
+    "--disable-download"
+  ];
 })
