@@ -1,9 +1,6 @@
-{ final, prev, virglrenderer-src, patchSrc }:
+{ prev, patchSrc }:
 
 prev.virglrenderer.overrideAttrs (oldAttrs: {
-  version = "git-${virglrenderer-src.shortRev or virglrenderer-src.rev}";
-  src = virglrenderer-src;
-
   patches = (oldAttrs.patches or []) ++ [
     "${patchSrc}/virglrenderer-xe-native-context.patch"
   ];

@@ -1,0 +1,38 @@
+{ prev, patchSrc, virglrenderer }:
+
+(prev.qemu.override {
+  inherit virglrenderer;
+
+  virglSupport = true;
+  openGLSupport = true;
+  sdlSupport = true;
+  gtkSupport = true;
+  vncSupport = true;
+  spiceSupport = true;
+  usbredirSupport = true;
+
+  pulseSupport = true;
+  pipewireSupport = true;
+  alsaSupport = true;
+
+  numaSupport = true;
+  seccompSupport = true;
+  smartcardSupport = true;
+  tpmSupport = true;
+  uringSupport = true;
+  fuseSupport = true;
+  capstoneSupport = true;
+  libiscsiSupport = true;
+}).overrideAttrs (oldAttrs: rec {
+  pname = "qemu-patched";
+  version = "11.0.0";
+
+  src = prev.fetchurl {
+    url = "https://download.qemu.org/qemu-${version}.tar.xz";
+    hash = "sha256-8enC18aUK8dAkdpU2tB682/arb82Ydf7unfYSNjh4ek=";
+  };
+
+  patches = (oldAttrs.patches or []) ++ [
+    "${patchSrc}/qemu-all-in-one.patch"
+  ];
+})
