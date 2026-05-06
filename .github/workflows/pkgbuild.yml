@@ -332,6 +332,14 @@ jobs:
           echo "$TAG" > last_built_version.txt
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          # last_built_version.txt only changes when upstream pkgver
+          # bumps. Daily soname-drift rebuilds keep the same TAG, so
+          # without the diff guard `git commit` fails "nothing to commit"
+          # and exits 1, marking the otherwise-successful build as failed.
+          if git diff --quiet last_built_version.txt; then
+              echo "last_built_version.txt unchanged ($TAG) — skipping commit."
+              exit 0
+          fi
           git add last_built_version.txt
           git commit -m "chore: record built version $TAG [skip ci]"
           git push
