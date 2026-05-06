@@ -19,6 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.get_tag.outputs.tag }}
+      pkg_sde: ${{ steps.get_tag.outputs.pkg_sde }}
       needs_build: ${{ steps.check.outputs.needs_build }}
 
     steps:
@@ -28,11 +29,21 @@ jobs:
       - name: Get latest Arch QEMU tag
         id: get_tag
         run: |
-          LATEST_TAG=$(curl -sf \
-            "${ARCH_GITLAB_API}/repository/tags?order_by=version&sort=desc&per_page=1" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['name'])")
-          echo "Latest Arch QEMU tag: $LATEST_TAG"
-          echo "tag=$LATEST_TAG" >> "$GITHUB_OUTPUT"
+          # Capture both the tag name and its commit timestamp.
+          # The committed_date is used as SOURCE_DATE_EPOCH downstream
+          # — same upstream tag → same SDE → reproducible build.
+          curl -sf "${ARCH_GITLAB_API}/repository/tags?order_by=version&sort=desc&per_page=1" \
+              > /tmp/qemu-tag.json
+          LATEST_TAG=$(python3 -c "import json; print(json.load(open('/tmp/qemu-tag.json'))[0]['name'])")
+          PKG_SDE=$(python3 -c "
+          import json,datetime
+          d = json.load(open('/tmp/qemu-tag.json'))[0]['commit']['committed_date']
+          print(int(datetime.datetime.fromisoformat(d.replace('Z','+00:00')).timestamp()))")
+          echo "Latest Arch QEMU tag: $LATEST_TAG (committed at SDE=$PKG_SDE)"
+          {
+            echo "tag=$LATEST_TAG"
+            echo "pkg_sde=$PKG_SDE"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Check if already built
         id: check
@@ -185,8 +196,18 @@ jobs:
 
       - name: Build package
         run: |
+          # SOURCE_DATE_EPOCH = upstream Arch tag commit timestamp.
+          # Same upstream tag → same SDE → reproducible build (modulo
+          # cachyos-v3 toolchain drift, which is the daily-rebuild's
+          # whole point so we accept it).
+          PKG_SDE="${{ needs.get-version.outputs.pkg_sde }}"
+          echo "Build SOURCE_DATE_EPOCH=$PKG_SDE"
           docker run --rm \
             --privileged \
+            -e SOURCE_DATE_EPOCH="$PKG_SDE" \
+            -e KBUILD_BUILD_TIMESTAMP="@$PKG_SDE" \
+            -e KBUILD_BUILD_USER=cmspam \
+            -e KBUILD_BUILD_HOST=cmspam-build \
             -v "$PWD/build:/pkg" \
             "${{ matrix.docker_image }}" \
             bash -c "
@@ -200,11 +221,22 @@ jobs:
               useradd -m builder
               echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder
               chown -R builder:builder /pkg
+
+              echo '=== Reproducibility flags in makepkg.conf ==='
+              printf '%s\n' \\
+                  '' \\
+                  '# Reproducibility additions' \\
+                  'CFLAGS=\"\$CFLAGS -ffile-prefix-map=/tmp=/build -ffile-prefix-map=/home/builder=/build\"' \\
+                  'CXXFLAGS=\"\$CXXFLAGS -ffile-prefix-map=/tmp=/build -ffile-prefix-map=/home/builder=/build\"' \\
+                  'LDFLAGS=\"\$LDFLAGS -Wl,--build-id=sha1\"' \\
+                  'PACKAGER=\"cmspam <cmspam@localhost>\"' \\
+                  >> /etc/makepkg.conf
+
               echo '=== Importing GPG Key ==='
               sudo -u builder gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys 3353C9CEF108B584
               echo '=== Building package ==='
               cd /pkg
-              sudo -u builder makepkg -sf --noconfirm
+              sudo -E -u builder makepkg -sf --noconfirm
             "
 
           echo ""
