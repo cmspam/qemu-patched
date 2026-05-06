@@ -2,8 +2,9 @@ name: Build and Publish QEMU
 
 on:
   schedule:
-    - cron: '0 6 * * *'   # 06:00 UTC
-    - cron: '0 18 * * *'  # 18:00 UTC
+    # Daily at 14:00 UTC — 4 hours before cache22's 18:00 image build,
+    # so cache22's pacman -S sees fresh v3-rebuilt qemu binaries.
+    - cron: '0 14 * * *'
   workflow_dispatch:
 
 concurrency:
@@ -36,16 +37,15 @@ jobs:
       - name: Check if already built
         id: check
         run: |
+          # Force daily rebuild against current Arch state. Pre-built
+          # binaries on rolling Arch get stale as upstream library
+          # sonames bump (glib2, virglrenderer, libslirp, glibc, …).
+          # Rebuilding daily keeps everything linked against current
+          # libs even when the upstream Arch packaging tag hasn't moved.
           LATEST="${{ steps.get_tag.outputs.tag }}"
           LAST="$(cat last_built_version.txt 2>/dev/null || echo '')"
-          echo "Last built: '$LAST' | Latest: '$LATEST'"
-          if [[ "$LAST" == "$LATEST" ]]; then
-            echo "Already up to date, skipping build."
-            echo "needs_build=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "New version detected, will build."
-            echo "needs_build=true" >> "$GITHUB_OUTPUT"
-          fi
+          echo "Last built: '$LAST' | Latest: '$LATEST' (forced rebuild)"
+          echo "needs_build=true" >> "$GITHUB_OUTPUT"
 
   build:
     needs: get-version
