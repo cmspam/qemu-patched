@@ -236,7 +236,11 @@ jobs:
               sudo -u builder gpg --batch --keyserver hkps://keyserver.ubuntu.com --recv-keys 3353C9CEF108B584
               echo '=== Building package ==='
               cd /pkg
-              sudo -E -u builder makepkg -sf --noconfirm
+              # sudo -E preserves env (SOURCE_DATE_EPOCH etc) BUT also
+              # inherits HOME=/root, so gpg/makepkg would look in
+              # /root/.gnupg instead of the builder's /home/builder/.gnupg
+              # where the GPG key was just imported. -H fixes HOME.
+              sudo -E -H -u builder makepkg -sf --noconfirm
             "
 
           echo ""
