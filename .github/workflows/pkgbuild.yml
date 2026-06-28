@@ -21,6 +21,7 @@ jobs:
       tag: ${{ steps.get_tag.outputs.tag }}
       pkg_sde: ${{ steps.get_tag.outputs.pkg_sde }}
       needs_build: ${{ steps.check.outputs.needs_build }}
+      fingerprint: ${{ steps.check.outputs.fingerprint }}
 
     steps:
       - name: Checkout repo
@@ -48,15 +49,29 @@ jobs:
       - name: Check if already built
         id: check
         run: |
-          # Force daily rebuild against current Arch state. Pre-built
-          # binaries on rolling Arch get stale as upstream library
-          # sonames bump (glib2, virglrenderer, libslirp, glibc, …).
-          # Rebuilding daily keeps everything linked against current
-          # libs even when the upstream Arch packaging tag hasn't moved.
+          # Build only when an input that actually changes the output
+          # bytes moved: the upstream Arch packaging tag, or our patch.
+          # A floating cachyos-v3 toolchain (gcc/glibc bump) alone is NOT
+          # a reason to rebuild: the resulting binary would differ byte-
+          # for-byte with no functional change, forcing every cache22
+          # consumer to redownload the layer. The fingerprint pins both
+          # real inputs; manual dispatch always forces a build.
           LATEST="${{ steps.get_tag.outputs.tag }}"
+          PATCH_HASH="$(sha256sum qemu-all-in-one.patch | cut -c1-12)"
+          FINGERPRINT="${LATEST}+p${PATCH_HASH}"
           LAST="$(cat last_built_version.txt 2>/dev/null || echo '')"
-          echo "Last built: '$LAST' | Latest: '$LATEST' (forced rebuild)"
-          echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          echo "Fingerprint: '$FINGERPRINT' | Last built: '$LAST'"
+          echo "fingerprint=$FINGERPRINT" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual dispatch — forcing build."
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          elif [ "$FINGERPRINT" = "$LAST" ]; then
+            echo "Up to date — skipping build."
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Inputs changed — building."
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+          fi
 
   build:
     needs: get-version
@@ -328,20 +343,21 @@ jobs:
 
       - name: Record built version
         run: |
-          TAG="${{ needs.get-version.outputs.tag }}"
-          echo "$TAG" > last_built_version.txt
+          FINGERPRINT="${{ needs.get-version.outputs.fingerprint }}"
+          echo "$FINGERPRINT" > last_built_version.txt
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # last_built_version.txt only changes when upstream pkgver
-          # bumps. Daily soname-drift rebuilds keep the same TAG, so
-          # without the diff guard `git commit` fails "nothing to commit"
-          # and exits 1, marking the otherwise-successful build as failed.
+          # The gate skips the build when the fingerprint is unchanged, so
+          # reaching here normally means it moved. Keep the diff guard for
+          # the manual-dispatch case (forced build at an unchanged
+          # fingerprint), where `git commit` would otherwise fail "nothing
+          # to commit" and mark the successful build as failed.
           if git diff --quiet last_built_version.txt; then
-              echo "last_built_version.txt unchanged ($TAG) — skipping commit."
+              echo "last_built_version.txt unchanged ($FINGERPRINT) — skipping commit."
               exit 0
           fi
           git add last_built_version.txt
-          git commit -m "chore: record built version $TAG [skip ci]"
+          git commit -m "chore: record built version $FINGERPRINT [skip ci]"
           git push
 
       - name: Build summary
